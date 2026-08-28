@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Local-only GBPUSD research and backtesting toolkit."
+requires-python = ">=3.12,<3.13"
+readme = "README.md"
+dependencies = [
+    "typer>=0.12,<1.0",
+    "PyYAML>=6.0,<7.0",
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+    "import-linter>=2.0,<3.0",
+]
+
+[project.scripts]
+jarvis = "jarvis.cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

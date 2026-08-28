@@ -1,0 +1,13 @@
+data/
+!data/manifests/
+ledger/
+reports/
+logs/
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.import_linter_cache/

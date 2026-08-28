@@ -1,0 +1,207 @@
+[importlinter]
+root_package = jarvis
+
+# --- Layer contract (Technical Bible Part 1 §B.1) ------------------------
+#
+# Five layers, top to bottom. A module may import its own layer and any
+# layer strictly below; never above.
+#
+# DEVIATION FROM THE LITERAL WORDING OF WP-000-CORRECTION, DOCUMENTED PER
+# ITS OWN "stop and report" INSTRUCTION:
+#
+# The correction text says both (a) "modules within a layer may depend on
+# each other -- this is not a strict chain" and (b) "use import-linter's
+# independent-layer-group syntax". These two instructions conflict for this
+# tool. In import-linter's `layers` contract, sibling modules on one line
+# joined with `|` are *independent*, meaning imports BETWEEN them are
+# FORBIDDEN (see importlinter/contracts/layers.py and
+# grimp/application/graph.py: "should imports between sibling modules be
+# forbidden (default) or allowed?" -- forbidden is the `|` / independent
+# case). Siblings joined with `:` are non-independent, meaning imports
+# between them ARE allowed. Using `|` ("independent-layer-group syntax" as
+# named in the correction) would silently forbid the intra-layer imports
+# that rule (a) explicitly requires. I have followed the explicit prose
+# rule (a) and used `:` below, since that is the stated *behaviour*
+# requirement, not the possibly-mislabelled syntax name. If "independent"
+# was actually intended, swap every `:` below for `|`.
+[importlinter:contract:layers]
+name = Five-layer architecture (Technical Bible Part 1 §B.1)
+type = layers
+layers =
+    jarvis.cli : jarvis.reporting
+    jarvis.describe : jarvis.backtest : jarvis.statistics : jarvis.robustness : jarvis.forward
+    jarvis.experiments : jarvis.vault
+    jarvis.features : jarvis.strategies : jarvis.strategy_impls : jarvis.opportunities : jarvis.execution
+    jarvis.core : jarvis.provenance : jarvis.timeengine : jarvis.sessions : jarvis.ingest : jarvis.bars : jarvis.qa
+
+# --- Purity rule (Part 1 §B.1) --------------------------------------------
+# features, strategies and opportunities may not import the research /
+# research-control layers, even though layer ordering alone already
+# forbids this. Named explicitly so a violation reports "purity rule"
+# rather than a generic layer-violation message.
+[importlinter:contract:purity-rule]
+name = purity rule
+type = forbidden
+source_modules =
+    jarvis.features
+    jarvis.strategies
+    jarvis.opportunities
+forbidden_modules =
+    jarvis.experiments
+    jarvis.statistics
+    jarvis.robustness
+    jarvis.backtest
+    jarvis.reporting
+
+# --- Named forbidden-dependency pairs (Part 1 §B.3) -----------------------
+
+[importlinter:contract:provenance-isolation]
+name = provenance depends on nothing but core
+type = forbidden
+source_modules =
+    jarvis.provenance
+forbidden_modules =
+    jarvis.timeengine
+    jarvis.sessions
+    jarvis.ingest
+    jarvis.bars
+    jarvis.qa
+    jarvis.features
+    jarvis.strategies
+    jarvis.strategy_impls
+    jarvis.opportunities
+    jarvis.execution
+    jarvis.vault
+    jarvis.experiments
+    jarvis.describe
+    jarvis.backtest
+    jarvis.statistics
+    jarvis.robustness
+    jarvis.forward
+    jarvis.reporting
+    jarvis.cli
+
+# Placeholder: no storage-access submodule exists under `bars` yet (`bars`
+# is still an empty skeleton per WP-000). `jarvis.bars.storage` names the
+# future Parquet/DuckDB access point; import-linter silently skips forbidden
+# targets that do not yet exist in the graph, so this contract is
+# vacuously KEPT today and starts enforcing the moment that submodule is
+# created. Update the target name here if a later work package names it
+# differently.
+[importlinter:contract:single-reader-rule]
+name = single-reader rule: only bars and vault may access data/ storage
+type = forbidden
+source_modules =
+    jarvis.core
+    jarvis.provenance
+    jarvis.timeengine
+    jarvis.sessions
+    jarvis.ingest
+    jarvis.qa
+    jarvis.features
+    jarvis.strategies
+    jarvis.strategy_impls
+    jarvis.opportunities
+    jarvis.execution
+    jarvis.experiments
+    jarvis.describe
+    jarvis.backtest
+    jarvis.statistics
+    jarvis.robustness
+    jarvis.forward
+    jarvis.reporting
+    jarvis.cli
+forbidden_modules =
+    jarvis.bars.storage
+
+[importlinter:contract:ingest-restriction]
+name = single-reader: ingest cannot read bars
+type = forbidden
+source_modules =
+    jarvis.ingest
+forbidden_modules =
+    jarvis.bars
+    jarvis.qa
+    jarvis.features
+    jarvis.strategies
+    jarvis.strategy_impls
+    jarvis.opportunities
+    jarvis.execution
+    jarvis.experiments
+    jarvis.vault
+    jarvis.describe
+    jarvis.backtest
+    jarvis.statistics
+    jarvis.robustness
+    jarvis.forward
+    jarvis.reporting
+    jarvis.cli
+
+[importlinter:contract:bars-vault-circularity]
+name = bars cannot depend on vault (circular)
+type = forbidden
+source_modules =
+    jarvis.bars
+forbidden_modules =
+    jarvis.vault
+
+[importlinter:contract:features-restriction]
+name = features cannot depend on bars directly
+type = forbidden
+source_modules =
+    jarvis.features
+forbidden_modules =
+    jarvis.bars
+
+[importlinter:contract:strategies-restriction]
+name = strategies cannot depend on execution, experiments, statistics, or vault
+type = forbidden
+source_modules =
+    jarvis.strategies
+forbidden_modules =
+    jarvis.execution
+    jarvis.experiments
+    jarvis.statistics
+    jarvis.vault
+
+[importlinter:contract:execution-restriction]
+name = execution cannot depend on strategies or opportunities
+type = forbidden
+source_modules =
+    jarvis.execution
+forbidden_modules =
+    jarvis.strategies
+    jarvis.opportunities
+
+# Placeholder: `experiments` has no `ledger` submodule yet (it is still an
+# empty skeleton per WP-000), so "vault may depend on experiments.ledger
+# but nothing else in experiments" cannot be expressed precisely today --
+# forbidding all of `jarvis.experiments` would block the future unlock-record
+# access the correction describes, and forbidding nothing would not
+# encode the restriction at all. Until `experiments.ledger` exists, this
+# contract permits `jarvis.experiments` as a whole (already allowed by the
+# layer contract, since vault and experiments share L3) and revisit this
+# once `experiments.ledger` exists so only that submodule stays permitted.
+[importlinter:contract:vault-restriction]
+name = vault depends on nothing beyond core, bars, and experiments.ledger
+type = forbidden
+source_modules =
+    jarvis.vault
+forbidden_modules =
+    jarvis.provenance
+    jarvis.timeengine
+    jarvis.sessions
+    jarvis.ingest
+    jarvis.qa
+    jarvis.features
+    jarvis.strategies
+    jarvis.strategy_impls
+    jarvis.opportunities
+    jarvis.execution
+    jarvis.describe
+    jarvis.backtest
+    jarvis.statistics
+    jarvis.robustness
+    jarvis.forward
+    jarvis.reporting
+    jarvis.cli
