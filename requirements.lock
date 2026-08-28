@@ -1,7 +1,10 @@
 annotated-doc==0.0.5
+certifi==2026.7.22
+charset-normalizer==3.5.1
 click==8.5.0
 colorama==0.4.6
 grimp==3.15
+idna==3.19
 import-linter==2.13
 iniconfig==2.3.0
 markdown-it-py==4.2.0
@@ -11,8 +14,10 @@ pluggy==1.6.0
 Pygments==2.21.0
 pytest==8.4.2
 PyYAML==6.0.3
+requests==2.34.2
 rich==15.0.0
 shellingham==1.5.4
 typer==0.27.1
 typing_extensions==4.16.0
 tzdata==2026.3
+urllib3==2.7.0

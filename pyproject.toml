@@ -12,6 +12,7 @@ dependencies = [
     "typer>=0.12,<1.0",
     "PyYAML>=6.0,<7.0",
     "tzdata>=2024.1",
+    "requests>=2.31,<3.0",
 ]
 
 [project.optional-dependencies]
@@ -28,3 +29,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "live: hits the real Dukascopy endpoint over the network; excluded by default, run explicitly with -m live",
+]
+addopts = "-m \"not live\""
