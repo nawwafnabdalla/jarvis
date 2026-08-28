@@ -1,6 +1,6 @@
 """Raw Dukascopy tick blob fetching: retry, resumability, concurrency."""
 
-import threading
+import concurrent.futures
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -190,11 +190,10 @@ def ingest_range(
     if concurrency <= 1:
         worker(0)
     else:
-        threads = [threading.Thread(target=worker, args=(w,)) for w in range(concurrency)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(worker, w) for w in range(concurrency)]
+            for future in futures:
+                future.result()  # re-raises the first exception from this worker, if any
 
     completed_utc = _utc_now_iso()
 

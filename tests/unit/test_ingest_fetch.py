@@ -163,3 +163,17 @@ def test_weekend_range_all_empty_not_missing(tmp_path: Path):
         report = ingest_range(tmp_path, "GBPUSD", start, end, courtesy_delay_seconds=0)
     assert report.hours_missing == 0
     assert report.hours_empty == 3
+
+
+def test_disk_write_failure_in_concurrent_worker_still_raises(tmp_path: Path):
+    """The exact scenario that previously vanished silently: at concurrency > 1,
+    a write failure must propagate out of ingest_range, not disappear along
+    with the thread that hit it."""
+    start = _ns(2024, 1, 15, 0)
+    end = _ns(2024, 1, 15, 8)
+    with (
+        patch("jarvis.ingest.fetch.requests.get", return_value=_FakeResponse(200, b"data")),
+        patch.object(Path, "write_bytes", side_effect=OSError("disk full")),
+    ):
+        with pytest.raises(IntegrityError):
+            ingest_range(tmp_path, "GBPUSD", start, end, concurrency=4, courtesy_delay_seconds=0)

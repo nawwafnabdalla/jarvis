@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import typer
 
 from jarvis.core.config import load_instruments, load_periods, repo_root
-from jarvis.core.errors import ConfigError, UserError
+from jarvis.core.errors import ConfigError, JarvisError, UserError
 from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.ingest.fetch import ingest_range
@@ -176,9 +176,9 @@ def data_fetch(
             concurrency=concurrency,
         )
         elapsed = time.perf_counter() - started
-    except UserError as exc:
+    except JarvisError as exc:
         typer.echo(f"jarvis data fetch: {exc}")
-        raise typer.Exit(code=1) from exc
+        raise typer.Exit(code=exc.exit_code) from exc
 
     typer.echo()
     typer.echo(f"  Fetched            {report.hours_fetched}")
