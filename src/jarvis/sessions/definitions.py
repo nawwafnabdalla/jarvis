@@ -218,6 +218,21 @@ def load_session_set_def(session_set_id: str, version: int) -> SessionSetDef:
     if not path.is_file():
         raise SessionError(f"session set file not found: {path}")
 
+    stat = path.stat()
+    return _load_session_set_def_cached(session_set_id, version, path, stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=None)
+def _load_session_set_def_cached(
+    session_set_id: str, version: int, path: Path, mtime_ns: int, size: int
+) -> SessionSetDef:
+    """Cache key includes the file's mtime and size, not just
+    (session_set_id, version): different test cases routinely reuse the
+    same logical id/version against different tmp-path files (or the same
+    path with rewritten content), and a cache keyed on id/version alone
+    would silently serve a stale result from an earlier call -- a
+    validation guard that appears to run but never actually does, the same
+    failure class WP-001-CORRECTION fixed for worker-thread exceptions."""
     with path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle)
 
@@ -276,3 +291,6 @@ def load_session_set_def(session_set_id: str, version: int) -> SessionSetDef:
         thin_day_threshold=float(thin_day_threshold),
         sessions=sessions,
     )
+
+
+load_session_set_def.cache_clear = _load_session_set_def_cached.cache_clear

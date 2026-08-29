@@ -158,3 +158,55 @@ def test_thin_day_threshold_range_validated(isolated_repo_root: Path):
     )
     with pytest.raises(SessionError):
         load_session_set_def("test_set", 1)
+
+
+def test_cache_invalidates_when_file_changes(isolated_repo_root: Path):
+    """Proves the load_session_set_def cache is keyed on file content
+    (mtime + size), not just (session_set_id, version): overwriting the
+    same path with different content must not return the earlier call's
+    cached, now-stale result.
+
+    The replacement content is deliberately a different byte length (an
+    extra padding field), not just a same-length field swap -- two
+    same-length HH:MM time values would leave the file size identical,
+    and on a filesystem with coarse mtime resolution the cache key could
+    then fail to change at all, making this test pass by luck rather than
+    by actually exercising invalidation."""
+    path = _write_session_set(
+        isolated_repo_root,
+        "cache_test",
+        1,
+        {"london": {"tz": "Europe/London", "start": "08:00", "end": "12:00"}},
+    )
+    size_before = path.stat().st_size
+    definition = load_session_set_def("cache_test", 1)
+    assert "london" in definition.sessions
+
+    # Overwrite the SAME path with invalid content (end before start), and
+    # a padding note that guarantees a different file size regardless of
+    # mtime granularity.
+    path.write_text(
+        yaml.dump(
+            {
+                "session_set_id": "cache_test",
+                "version": 1,
+                "tzdata_version_at_authoring": "2026.3",
+                "fold_policy": {"ambiguous": "later", "nonexistent": "later"},
+                "exclude_partial": True,
+                "thin_day_threshold": 0.60,
+                "sessions": {
+                    "london": {
+                        "tz": "Europe/London",
+                        "start": "16:00",
+                        "end": "08:00",
+                        "note": "padding to guarantee a different file size than the original write",
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert path.stat().st_size != size_before
+
+    with pytest.raises(SessionError):
+        load_session_set_def("cache_test", 1)
