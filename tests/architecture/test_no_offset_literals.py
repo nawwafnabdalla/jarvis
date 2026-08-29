@@ -5,7 +5,9 @@ import ast
 import re
 from pathlib import Path
 
-_TIMEENGINE_DIR = Path(__file__).resolve().parents[2] / "src" / "jarvis" / "timeengine"
+_SRC_JARVIS = Path(__file__).resolve().parents[2] / "src" / "jarvis"
+_TIMEENGINE_DIR = _SRC_JARVIS / "timeengine"
+_SESSIONS_DIR = _SRC_JARVIS / "sessions"  # WP-004: scan extended to cover sessions/ too
 
 # Matches an offset-shaped substring like "+09:00", "-0500", "+5:30". This is
 # a targeted pattern for this one check only, applied to non-docstring
@@ -101,7 +103,8 @@ def _scan_file(path: Path) -> list[str]:
 
 def test_no_offset_literals_in_timeengine():
     all_violations: list[str] = []
-    for path in sorted(_TIMEENGINE_DIR.rglob("*.py")):
-        all_violations.extend(_scan_file(path))
+    for scan_dir in (_TIMEENGINE_DIR, _SESSIONS_DIR):
+        for path in sorted(scan_dir.rglob("*.py")):
+            all_violations.extend(_scan_file(path))
 
     assert not all_violations, "\n".join(all_violations)

@@ -1,0 +1,41 @@
+session_set_id: fx_core
+version: 1
+tzdata_version_at_authoring: "2026.3"
+fold_policy:
+  ambiguous: later
+  nonexistent: later
+# Consumed by later packages (bars/QA/features), not by WP-004.
+# Present here because session-set files are IMMUTABLE — omitting a field
+# a later package needs would force a v2 file and orphan every experiment
+# that referenced v1.
+exclude_partial: true
+thin_day_threshold: 0.60
+sessions:
+  tokyo:
+    tz: Asia/Tokyo
+    start: "09:00"
+    end: "15:00"
+    note: "Tokyo cash hours. Asia/Tokyo has observed no DST since 1951."
+  pre_london:
+    tz: Europe/London
+    start: "00:00"
+    end: "08:00"
+    note: >
+      The 'Asian range' window as used for London-open work, expressed in
+      London local time so its relationship to the London open is DST-stable.
+      Deliberately NOT the Tokyo session. See DECISION_LOG D-011.
+  london:
+    tz: Europe/London
+    start: "08:00"
+    end: "16:30"
+  london_open_window:
+    tz: Europe/London
+    start: "08:00"
+    end: "11:00"
+  new_york:
+    tz: America/New_York
+    start: "08:00"
+    end: "17:00"
+  overlap_london_ny:
+    derived: intersection
+    of: [london, new_york]
