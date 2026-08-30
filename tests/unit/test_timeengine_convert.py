@@ -3,6 +3,8 @@ from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from jarvis.core.errors import AmbiguousTimeError, UserError
 from jarvis.core.types import Nanos
@@ -166,13 +168,20 @@ def _roundtrip_check(iterations: int, seed: int) -> None:
         assert to_utc_ns(from_utc_ns(ns, tz)) == ns
 
 
-def test_roundtrip_property():
-    """Property test: for pseudo-random instants across 2007-2026 in all
-    three zones, to_utc_ns(from_utc_ns(ns, tz)) == ns for whole-microsecond
-    ns values. Uses stdlib `random` with a fixed seed rather than
-    `hypothesis` (carried debt D-030a; not installed, this package does not
-    grant pyproject.toml)."""
-    _roundtrip_check(10_000, seed=13)
+_ROUNDTRIP_START_US = to_utc_ns(datetime(2007, 1, 1, tzinfo=timezone.utc)) // 1000
+_ROUNDTRIP_END_US = to_utc_ns(datetime(2026, 12, 31, tzinfo=timezone.utc)) // 1000
+
+
+@given(
+    us=st.integers(min_value=_ROUNDTRIP_START_US, max_value=_ROUNDTRIP_END_US),
+    tz=st.sampled_from((_LONDON, _NY, _TOKYO)),
+)
+def test_roundtrip_property(us: int, tz: str) -> None:
+    """Property test: for instants across 2007-2026 in all three zones,
+    to_utc_ns(from_utc_ns(ns, tz)) == ns for whole-microsecond ns values.
+    Closes carried debt D-030a (WP-005 item 0)."""
+    ns = Nanos(us * 1000)
+    assert to_utc_ns(from_utc_ns(ns, tz)) == ns
 
 
 @pytest.mark.slow

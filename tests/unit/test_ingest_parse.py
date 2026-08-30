@@ -4,11 +4,12 @@ import struct
 from datetime import datetime, timezone
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from jarvis.core.errors import IntegrityError
 from jarvis.core.types import Nanos
-from jarvis.ingest.parse import Tick, parse_bi5
+from jarvis.ingest.parse import Tick, parse_bi5, parse_bi5_arrays
 
 _RECORD_STRUCT = struct.Struct(">IIIff")
 _POINT_SCALE = 1.0e-5  # GBPUSD
@@ -207,3 +208,96 @@ def test_property_n_records_round_trip(tmp_path: Path, n: int):
         assert tick.bid == pytest.approx(bid_pts * _POINT_SCALE, rel=1e-9)
         assert tick.ask_volume == pytest.approx(ask_vol, rel=1e-5)
         assert tick.bid_volume == pytest.approx(bid_vol, rel=1e-5)
+
+
+# WP-005 item 1: parse_bi5_arrays ---------------------------------------
+
+
+def test_parse_bi5_arrays_matches_parse_bi5_on_golden_fixture():
+    """The two paths must agree tick-for-tick on every field. Also pins
+    down field order (ask precedes bid in the wire format): if the two
+    fields were swapped in either implementation, bid/ask would come out
+    inverted and this comparison would fail."""
+    scalar = parse_bi5(_GOLDEN_FIXTURE_PATH, "GBPUSD", _GOLDEN_HOUR_NS, _POINT_SCALE)
+    arrays = parse_bi5_arrays(_GOLDEN_FIXTURE_PATH, "GBPUSD", _GOLDEN_HOUR_NS, _POINT_SCALE)
+
+    assert arrays.record_count == scalar.record_count == 5
+    assert arrays.instrument == scalar.instrument
+    assert arrays.hour_utc_ns == scalar.hour_utc_ns
+    assert arrays.source_path == scalar.source_path
+
+    for seq, tick in enumerate(scalar.ticks):
+        assert arrays.ts_utc_ns[seq] == tick.ts_utc_ns
+        assert arrays.bid[seq] == pytest.approx(tick.bid, abs=1e-9)
+        assert arrays.ask[seq] == pytest.approx(tick.ask, abs=1e-9)
+        assert arrays.bid_volume[seq] == pytest.approx(tick.bid_volume, abs=1e-6)
+        assert arrays.ask_volume[seq] == pytest.approx(tick.ask_volume, abs=1e-6)
+
+    # Explicit ask-before-bid assertion, independent of the loop above: the
+    # fixture's ask is always strictly greater than its bid.
+    assert np.all(arrays.ask > arrays.bid)
+
+
+def test_parse_bi5_arrays_zero_byte_file_produces_zero_ticks(tmp_path: Path):
+    path = tmp_path / "00h_ticks.bi5"
+    path.write_bytes(b"")
+
+    arrays = parse_bi5_arrays(path, "GBPUSD", Nanos(0), _POINT_SCALE)
+
+    assert arrays.record_count == 0
+    assert len(arrays.ts_utc_ns) == 0
+
+
+def test_parse_bi5_arrays_invalid_lzma_raises_integrity_error(tmp_path: Path):
+    path = tmp_path / "00h_ticks.bi5"
+    path.write_bytes(b"this is definitely not an lzma stream, just garbage bytes")
+
+    with pytest.raises(IntegrityError):
+        parse_bi5_arrays(path, "GBPUSD", Nanos(0), _POINT_SCALE)
+
+
+def test_parse_bi5_arrays_non_multiple_of_20_length_raises_integrity_error(tmp_path: Path):
+    raw = _RECORD_STRUCT.pack(0, 100000, 99900, 1.0, 1.0) + b"\x00\x01\x02\x03\x04"
+    path = tmp_path / "00h_ticks.bi5"
+    path.write_bytes(lzma.compress(raw))
+
+    with pytest.raises(IntegrityError) as excinfo:
+        parse_bi5_arrays(path, "GBPUSD", Nanos(0), _POINT_SCALE)
+
+    message = str(excinfo.value)
+    assert "25" in message
+    assert "5" in message
+
+
+@pytest.mark.parametrize("n", [1, 2, 17, 200, 500])
+def test_parse_bi5_arrays_property_n_records_round_trip(tmp_path: Path, n: int):
+    """Vectorised-path counterpart to test_property_n_records_round_trip,
+    same seeds and construction, asserting array equivalence to parse_bi5
+    instead of duplicating the round-trip logic."""
+    rng = random.Random(1000 + n)
+    records = [
+        (
+            rng.randrange(0, 3_600_000),
+            rng.randrange(0, 2**32),
+            rng.randrange(0, 2**32),
+            rng.uniform(0, 1000),
+            rng.uniform(0, 1000),
+        )
+        for _ in range(n)
+    ]
+
+    raw = _build_bi5(records)
+    path = tmp_path / "00h_ticks.bi5"
+    path.write_bytes(raw)
+
+    hour_ns = Nanos(0)
+    scalar = parse_bi5(path, "GBPUSD", hour_ns, _POINT_SCALE)
+    arrays = parse_bi5_arrays(path, "GBPUSD", hour_ns, _POINT_SCALE)
+
+    assert arrays.record_count == n
+    for seq, tick in enumerate(scalar.ticks):
+        assert arrays.ts_utc_ns[seq] == tick.ts_utc_ns
+        assert arrays.bid[seq] == pytest.approx(tick.bid, rel=1e-9)
+        assert arrays.ask[seq] == pytest.approx(tick.ask, rel=1e-9)
+        assert arrays.bid_volume[seq] == pytest.approx(tick.bid_volume, rel=1e-5)
+        assert arrays.ask_volume[seq] == pytest.approx(tick.ask_volume, rel=1e-5)

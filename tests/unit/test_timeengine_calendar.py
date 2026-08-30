@@ -1,7 +1,8 @@
-import random
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from jarvis.core.types import Nanos
 from jarvis.timeengine.calendar import (
@@ -65,19 +66,19 @@ def test_friday_1700_ny_is_excluded_half_open():
 # T14 ------------------------------------------------------------------
 
 
-def test_trading_day_monotonic():
-    start_ns = to_utc_ns(datetime(2007, 1, 1, tzinfo=timezone.utc))
-    end_ns = to_utc_ns(datetime(2026, 12, 31, tzinfo=timezone.utc))
+_MONOTONIC_START_NS = to_utc_ns(datetime(2007, 1, 1, tzinfo=timezone.utc))
+_MONOTONIC_END_NS = to_utc_ns(datetime(2026, 12, 31, tzinfo=timezone.utc))
 
-    rng = random.Random(14)
-    samples = sorted(rng.randrange(start_ns, end_ns) for _ in range(100_000))
 
-    prev_day = None
-    for ns in samples:
-        day = trading_day(Nanos(ns))
-        if prev_day is not None:
-            assert day >= prev_day
-        prev_day = day
+@given(
+    ns_a=st.integers(min_value=_MONOTONIC_START_NS, max_value=_MONOTONIC_END_NS),
+    ns_b=st.integers(min_value=_MONOTONIC_START_NS, max_value=_MONOTONIC_END_NS),
+)
+def test_trading_day_monotonic(ns_a: int, ns_b: int) -> None:
+    """Property test: trading_day is monotonic non-decreasing in its input
+    across 2007-2026. Closes carried debt D-030a (WP-005 item 0)."""
+    lo, hi = sorted((ns_a, ns_b))
+    assert trading_day(Nanos(lo)) <= trading_day(Nanos(hi))
 
 
 # Unnamed required tests ------------------------------------------------

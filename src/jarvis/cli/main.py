@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import typer
 
+from jarvis.bars.resample import resample_range
 from jarvis.core.config import load_instruments, load_periods, repo_root
 from jarvis.core.errors import ConfigError, JarvisError, UserError
 from jarvis.core.hashing import sha256_file
@@ -197,4 +198,48 @@ def data_fetch(
     typer.echo(f"  Missing            {report.hours_missing}")
     typer.echo(f"  Rate limited       {report.hours_rate_limited}")
     typer.echo(f"  Total bytes        {report.total_bytes:,}")
+    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+
+
+@data_app.command("resample")
+def data_resample(
+    from_: str = typer.Option(..., "--from", help="ISO 8601 UTC, hour-aligned"),
+    to: str = typer.Option(..., "--to", help="ISO 8601 UTC, hour-aligned, exclusive"),
+    allow_incomplete: bool = typer.Option(
+        False,
+        "--allow-incomplete",
+        help="Proceed even if some hours in range have no raw blob (a hole).",
+    ),
+) -> None:
+    """Resample raw GBP/USD ticks for the given UTC range into 1-minute bars."""
+    try:
+        start_ns = _parse_iso_utc_ns(from_, option_name="--from")
+        end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        root = repo_root()
+
+        hours_expected = (end_ns - start_ns) // NS_PER_HOUR
+        typer.echo(
+            f"Resampling {_INSTRUMENT}  {from_} -> {to}  ({hours_expected} hours)"
+        )
+
+        started = time.perf_counter()
+        report = resample_range(
+            root,
+            _INSTRUMENT,
+            start_ns,
+            end_ns,
+            allow_incomplete=allow_incomplete,
+        )
+        elapsed = time.perf_counter() - started
+    except JarvisError as exc:
+        typer.echo(f"jarvis data resample: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc
+
+    typer.echo()
+    typer.echo(f"  Hours with data    {report.hours_with_data}")
+    typer.echo(f"  Hours empty        {report.hours_empty}")
+    typer.echo(f"  Hours unfetched    {report.hours_unfetched}")
+    typer.echo(f"  Bars written       {report.bars_written}")
+    typer.echo(f"  Minutes absent     {report.minutes_absent}")
+    typer.echo(f"  Months written     {', '.join(report.months_written)}")
     typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
