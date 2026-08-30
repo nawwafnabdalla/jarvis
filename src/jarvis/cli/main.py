@@ -153,6 +153,13 @@ def data_fetch(
     to: str = typer.Option(..., "--to", help="ISO 8601 UTC, hour-aligned, exclusive"),
     force_refetch: bool = typer.Option(False, "--force-refetch"),
     concurrency: int = typer.Option(4, "--concurrency"),
+    min_seconds_between_requests: float = typer.Option(
+        0.25,
+        "--min-seconds-between-requests",
+        help="Global minimum spacing between requests, across all workers combined.",
+    ),
+    max_attempts: int = typer.Option(3, "--max-attempts"),
+    timeout_seconds: float = typer.Option(30.0, "--timeout-seconds"),
 ) -> None:
     """Fetch raw GBP/USD tick data for the given UTC range."""
     try:
@@ -174,6 +181,9 @@ def data_fetch(
             end_ns,
             force_refetch=force_refetch,
             concurrency=concurrency,
+            min_seconds_between_requests=min_seconds_between_requests,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
         )
         elapsed = time.perf_counter() - started
     except JarvisError as exc:
@@ -185,5 +195,6 @@ def data_fetch(
     typer.echo(f"  Empty (no data)    {report.hours_empty}")
     typer.echo(f"  Skipped (existing) {report.hours_skipped_existing}")
     typer.echo(f"  Missing            {report.hours_missing}")
+    typer.echo(f"  Rate limited       {report.hours_rate_limited}")
     typer.echo(f"  Total bytes        {report.total_bytes:,}")
     typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
