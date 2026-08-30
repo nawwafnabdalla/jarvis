@@ -72,6 +72,14 @@ def test_nested_non_string_dict_key_rejected():
         canonical_json({"a": {"b": {2: "x"}}})
 
 
+def test_non_string_dict_key_nested_inside_list_rejected():
+    """A dict-only recursion would miss this: the offending dict is inside
+    a list, not directly inside another dict. json.dumps coerces the key
+    just as silently either way."""
+    with pytest.raises(HashingError):
+        canonical_json({"a": [{"b": {2: "x"}}]})
+
+
 def test_bool_dict_key_rejected():
     # bool is not str, and json would otherwise silently render it "true"/
     # "false", colliding with an actual string key "true"/"false".
@@ -92,10 +100,12 @@ def test_mixed_type_keys_raise_hashing_error_not_typeerror():
 
 def test_string_keys_still_work():
     """Confirms no existing hash changed: a fixed structure of all-string
-    keys must still produce this exact digest. The A-6 fix only adds a
-    pre-check that a valid (all-string-key) structure always passes; it
-    does not alter json.dumps's own arguments, so this digest is identical
-    to what canonical_json produced before the fix."""
+    keys must still produce this exact digest. Verified directly against
+    the pre-A-6-fix implementation (commit 57024e3), not just reasoned
+    about: both produce fa57f877...4bff81 for this object, byte-for-byte
+    identical. The A-6 fix only adds a pre-check that a valid
+    (all-string-key) structure always passes; it does not alter
+    json.dumps's own arguments."""
     obj = {"b": 1, "a": {"nested": [1, 2, 3], "z": "x"}, "c": 2.5}
     assert (
         sha256_canonical(obj)
