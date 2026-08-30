@@ -244,8 +244,14 @@ def resample_range(
 
     def flush() -> None:
         nonlocal bars_written, acc
-        if current_month is None or not acc["ts_utc_ns"]:
+        if current_month is None:
             return
+        # Written even when acc is empty (e.g. every hour in this month was
+        # a 0-byte market-closed blob): a schema-less empty frame would
+        # roundtrip through Parquet with no columns at all, and a later
+        # read_bars caller selecting e.g. bid_c would hit a column error on
+        # data that is perfectly valid -- zero bars is a legitimate result,
+        # not an absent one, and must carry BAR_SCHEMA's dtypes either way.
         frame = pl.DataFrame(acc, schema=BAR_SCHEMA)
         write_bars(repo_root, instrument, current_month[0], current_month[1], frame)
         bars_written += len(acc["ts_utc_ns"])

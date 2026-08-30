@@ -15,7 +15,7 @@ import polars as pl
 from jarvis.core.errors import IntegrityError
 from jarvis.core.types import Nanos
 
-BAR_SCHEMA: dict[str, pl.DataType | type] = {
+BAR_SCHEMA: dict[str, pl.DataType] = {
     "ts_utc_ns": pl.Int64,
     "bid_o": pl.Float64,
     "bid_h": pl.Float64,

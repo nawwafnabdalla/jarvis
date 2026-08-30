@@ -81,6 +81,29 @@ def test_no_ticks_at_all_produces_zero_bars(repo: Path):
     assert report.hours_unfetched == 0
 
 
+def test_all_hours_empty_month_still_written_with_explicit_schema(repo: Path):
+    """A month where every hour is a 0-byte market-closed blob legitimately
+    produces zero bars -- but the month file must still be written, with
+    BAR_SCHEMA's dtypes, not skipped or written as a column-less frame.
+    Otherwise a later read_bars caller selecting e.g. bid_c hits a column
+    error on data that is perfectly valid."""
+    from jarvis.bars.store import BAR_SCHEMA, bars_path
+
+    hour1 = _hour_ns(2024, 1, 15, 3)
+    hour2 = Nanos(hour1 + NS_PER_HOUR)
+    _write_empty_blob(repo, "GBPUSD", hour1)
+    _write_empty_blob(repo, "GBPUSD", hour2)
+
+    report = resample_range(repo, "GBPUSD", hour1, Nanos(hour2 + NS_PER_HOUR))
+    assert report.bars_written == 0
+    assert report.months_written == ("2024-01",)
+    assert bars_path(repo, "GBPUSD", 2024, 1).is_file()
+
+    df = read_bars(repo, "GBPUSD", hour1, Nanos(hour2 + NS_PER_HOUR))
+    assert df.height == 0
+    assert df.schema == pl.Schema(BAR_SCHEMA)
+
+
 # Acceptance 3: bid_h/ask_h from different ticks ---------------------------
 
 
