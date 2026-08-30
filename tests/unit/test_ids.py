@@ -34,3 +34,17 @@ def test_new_sequential_id_increments():
 def test_new_sequential_id_malformed_raises():
     with pytest.raises(IdError):
         new_sequential_id("FAM", ["FAM-abc"])
+
+
+def test_mismatched_prefix_rejected():
+    with pytest.raises(IdError):
+        new_sequential_id("FAM", ["HYP-009"])
+
+
+def test_mixed_prefixes_rejected():
+    with pytest.raises(IdError):
+        new_sequential_id("FAM", ["FAM-001", "DSV-042"])
+
+
+def test_matching_prefix_still_increments():
+    assert new_sequential_id("FAM", ["FAM-001", "FAM-007"]) == "FAM-008"

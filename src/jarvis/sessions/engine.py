@@ -49,6 +49,17 @@ def _is_partial(start_ns: Nanos, end_ns: Nanos) -> bool:
 class SessionSet:
     def __init__(self, definition: SessionSetDef) -> None:
         self.definition = definition
+        # window() is a pure function of (definition, name, trading_day):
+        # self.definition never changes after construction (SessionSetDef is
+        # frozen), and load_session_set_def's content-aware cache (WP-004
+        # addendum) means a changed YAML produces a new SessionSetDef and
+        # therefore a new SessionSet with a fresh, empty cache here -- there
+        # is no path by which this dict can go stale against a live
+        # instance. An instance-level dict (not functools.lru_cache on the
+        # method) is deliberate: an lru_cache on a bound method keeps `self`
+        # alive for the cache's lifetime and leaks across instances; this
+        # dict's lifetime is exactly the SessionSet's own.
+        self._window_cache: dict[tuple[str, date], Window] = {}
 
     def session_names(self) -> tuple[str, ...]:
         return tuple(self.definition.sessions)
@@ -56,6 +67,11 @@ class SessionSet:
     def window(self, name: str, trading_day: date) -> Window:
         """Resolve a named session's window for the given trading day.
         Raises SessionError for an unknown session name."""
+        cache_key = (name, trading_day)
+        cached = self._window_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         session = self.definition.sessions.get(name)
         if session is None:
             raise SessionError(f"unknown session: {name!r}")
@@ -75,7 +91,7 @@ class SessionSet:
             )
 
         empty = start_ns == end_ns
-        return Window(
+        result = Window(
             name=name,
             trading_day=trading_day,
             start_ns=start_ns,
@@ -83,6 +99,8 @@ class SessionSet:
             partial=False if empty else _is_partial(start_ns, end_ns),
             empty=empty,
         )
+        self._window_cache[cache_key] = result
+        return result
 
     def membership(self, ns: Nanos) -> frozenset[str]:
         """Every session name whose window contains this instant.

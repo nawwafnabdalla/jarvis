@@ -81,6 +81,17 @@ def load_periods() -> dict[str, tuple[date, date | None]]:
     if hold_end is not None:
         raise ConfigError("holdout period must be open-ended (end: null)")
 
+    if dev_start >= dev_end:
+        raise ConfigError(
+            f"period 'development' is inverted or empty: start ({dev_start}) "
+            f"must be before end ({dev_end})"
+        )
+    if val_start >= val_end:
+        raise ConfigError(
+            f"period 'validation' is inverted or empty: start ({val_start}) "
+            f"must be before end ({val_end})"
+        )
+
     if val_start != dev_end + timedelta(days=1):
         raise ConfigError(
             f"gap or overlap between development (ends {dev_end}) and validation "

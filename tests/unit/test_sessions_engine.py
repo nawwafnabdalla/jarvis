@@ -1,3 +1,4 @@
+import time as time_module
 from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
@@ -7,6 +8,7 @@ from jarvis.core.types import Nanos
 from jarvis.sessions import load_session_set
 from jarvis.timeengine import (
     NS_PER_HOUR,
+    NS_PER_MINUTE,
     from_utc_ns,
     is_weekend_gap,
     local_to_utc_ns,
@@ -163,3 +165,32 @@ def test_partial_true_when_window_overlaps_weekend(session_set):
 def test_unknown_session_name_raises(session_set):
     with pytest.raises(SessionError):
         session_set.window("nope", date(2023, 6, 5))
+
+
+def test_window_is_memoised_within_an_instance():
+    """The same (name, trading_day) returns an identical object, not merely
+    an equal one -- proving no recomputation occurred."""
+    ss = load_session_set("fx_core", 1)
+    a = ss.window("london", date(2023, 6, 5))
+    b = ss.window("london", date(2023, 6, 5))
+    assert a is b
+
+
+def test_membership_performance_regression():
+    """A-2 regression guard. Session membership over one full trading day of
+    1-minute instants must complete well inside a second. Before memoisation
+    this took ~0.28s for 1440 calls (198 us/call), which extrapolates to ~19
+    minutes over 16 years of bars. The threshold is deliberately loose --
+    this catches a reintroduced O(sessions x boundaries) recomputation, not
+    a modest slowdown, so it should not be flaky on slower hardware."""
+    ss = load_session_set("fx_core", 1)
+    start_ns, end_ns = trading_day_bounds(date(2023, 6, 5))
+    t0 = time_module.perf_counter()
+    ns = start_ns
+    count = 0
+    while ns < end_ns and count < 1440:
+        ss.membership(Nanos(ns))
+        ns += NS_PER_MINUTE
+        count += 1
+    elapsed = time_module.perf_counter() - t0
+    assert elapsed < 0.5, f"membership over {count} instants took {elapsed:.2f}s"

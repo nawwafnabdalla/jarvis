@@ -13,7 +13,7 @@ IdPrefix = Literal[
 ]
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-_SEQUENTIAL_ID_RE = re.compile(r"^[A-Za-z]+-(\d+)$")
+_SEQUENTIAL_ID_RE = re.compile(r"^([A-Za-z]+)-(\d+)$")
 
 
 def _encode_crockford_base32(data: bytes) -> str:
@@ -27,7 +27,18 @@ def _encode_crockford_base32(data: bytes) -> str:
 
 
 def new_ulid() -> str:
-    """26-character Crockford base32 ULID, lexicographically sortable by time."""
+    """26-character Crockford base32 ULID. Sortable by time ACROSS
+    millisecond boundaries: two ULIDs generated in different milliseconds
+    always sort in generation order. Two ULIDs generated within the SAME
+    millisecond may sort in either order -- this implementation draws
+    fresh randomness for the non-timestamp bits on every call rather than
+    monotonically incrementing them within a millisecond (as the reference
+    ULID spec optionally allows), so intra-millisecond ordering is not
+    preserved. Nothing in this project currently depends on intra-
+    millisecond ordering (RUN ids are ordered by started_utc in practice);
+    if that changes, monotonic generation needs its own package and its
+    own decision, since it introduces shared mutable state and a
+    thread-safety question."""
     timestamp_ms = int(time.time() * 1000)
     timestamp_bytes = timestamp_ms.to_bytes(6, "big")
     random_bytes = secrets.token_bytes(10)
@@ -43,11 +54,19 @@ def new_sequential_id(prefix: IdPrefix, existing: list[str]) -> str:
     """Return f'{prefix}-{n:03d}' where n is one greater than the highest
     zero-padded integer suffix present in `existing`. Used for FAM, HYP, DSV,
     which are human-referenced and must be short. Raises IdError if `existing`
-    contains a malformed id."""
+    contains a malformed id, or an id whose prefix does not match `prefix` --
+    a caller passing an unfiltered, mixed-prefix id list (e.g. read directly
+    from a ledger table) must fail loudly rather than silently number
+    against the wrong series."""
     max_n = 0
     for entry in existing:
         match = _SEQUENTIAL_ID_RE.fullmatch(entry)
         if match is None:
             raise IdError(f"malformed sequential id in existing list: {entry!r}")
-        max_n = max(max_n, int(match.group(1)))
+        entry_prefix, digits = match.group(1), match.group(2)
+        if entry_prefix != prefix:
+            raise IdError(
+                f"existing id {entry!r} has prefix {entry_prefix!r}, expected {prefix!r}"
+            )
+        max_n = max(max_n, int(digits))
     return f"{prefix}-{max_n + 1:03d}"

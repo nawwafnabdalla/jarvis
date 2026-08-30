@@ -60,3 +60,55 @@ def test_sha256_canonical_stable_across_processes():
 def test_sha256_file_missing_raises(tmp_path: Path):
     with pytest.raises(HashingError):
         sha256_file(tmp_path / "does_not_exist.bin")
+
+
+def test_non_string_dict_key_rejected():
+    with pytest.raises(HashingError):
+        canonical_json({1: "x"})
+
+
+def test_nested_non_string_dict_key_rejected():
+    with pytest.raises(HashingError):
+        canonical_json({"a": {"b": {2: "x"}}})
+
+
+def test_bool_dict_key_rejected():
+    # bool is not str, and json would otherwise silently render it "true"/
+    # "false", colliding with an actual string key "true"/"false".
+    with pytest.raises(HashingError):
+        canonical_json({True: "x"})
+
+
+def test_mixed_type_keys_raise_hashing_error_not_typeerror():
+    try:
+        canonical_json({1: "a", "b": 2})
+    except HashingError:
+        pass
+    except TypeError:
+        pytest.fail("canonical_json leaked a raw TypeError instead of HashingError")
+    else:
+        pytest.fail("canonical_json did not raise for a mixed-type-key dict")
+
+
+def test_string_keys_still_work():
+    """Confirms no existing hash changed: a fixed structure of all-string
+    keys must still produce this exact digest. The A-6 fix only adds a
+    pre-check that a valid (all-string-key) structure always passes; it
+    does not alter json.dumps's own arguments, so this digest is identical
+    to what canonical_json produced before the fix."""
+    obj = {"b": 1, "a": {"nested": [1, 2, 3], "z": "x"}, "c": 2.5}
+    assert (
+        sha256_canonical(obj)
+        == "fa57f8773c06f227023f14720b72d15dc77c793495d6983cb853d66a754bff81"
+    )
+
+    nested_a = {"outer": {"z": 1, "y": {"b": 2, "a": 3}}}
+    nested_b = {"outer": {"y": {"a": 3, "b": 2}, "z": 1}}
+    assert sha256_canonical(nested_a) == sha256_canonical(nested_b)
+
+
+def test_tuple_list_hash_identically_documented_behavior():
+    """Documented, deliberately not fixed (A-6): tuples and lists serialise
+    to the same JSON array, so they hash identically. This is a semantic
+    decision (JSON has no tuple type), not a bug."""
+    assert sha256_canonical((1, 2)) == sha256_canonical([1, 2])

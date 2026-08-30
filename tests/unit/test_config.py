@@ -49,3 +49,15 @@ def test_load_periods_rejects_gap(isolated_repo: Path):
     )
     with pytest.raises(ConfigError):
         load_periods()
+
+
+def test_inverted_period_rejected(isolated_repo: Path):
+    config_path = isolated_repo / "config" / "periods.yaml"
+    config_path.write_text(
+        "development:\n  start: 2018-01-01\n  end: 2007-12-31\n"
+        "validation:\n  start: 2019-01-01\n  end: 2022-12-31\n"
+        "holdout:\n  start: 2023-01-01\n  end: null\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError):
+        load_periods()
