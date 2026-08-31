@@ -16,6 +16,7 @@ from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.ingest.fetch import ingest_range
 from jarvis.ingest.urls import NS_PER_HOUR
+from jarvis.qa.report import run_checks, write_report
 
 app = typer.Typer(name="jarvis")
 
@@ -243,3 +244,43 @@ def data_resample(
     typer.echo(f"  Minutes absent     {report.minutes_absent}")
     typer.echo(f"  Months written     {', '.join(report.months_written)}")
     typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+
+
+@data_app.command("validate")
+def data_validate(
+    from_: str = typer.Option(..., "--from", help="ISO 8601 UTC, hour-aligned"),
+    to: str = typer.Option(..., "--to", help="ISO 8601 UTC, hour-aligned, exclusive"),
+) -> None:
+    """Run the QA check suite over the given UTC range and write a report.
+
+    Exit code 3 if any ERROR finding exists, 0 otherwise -- usable as a
+    gate in a script. WARNING and INFO findings never affect the exit
+    code."""
+    try:
+        start_ns = _parse_iso_utc_ns(from_, option_name="--from")
+        end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        root = repo_root()
+
+        hours_expected = (end_ns - start_ns) // NS_PER_HOUR
+        typer.echo(
+            f"Validating {_INSTRUMENT}  {from_} -> {to}  ({hours_expected} hours)"
+        )
+
+        started = time.perf_counter()
+        report = run_checks(root, _INSTRUMENT, start_ns, end_ns)
+        elapsed = time.perf_counter() - started
+        md_path, _parquet_path = write_report(root, report)
+    except JarvisError as exc:
+        typer.echo(f"jarvis data validate: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc
+
+    typer.echo()
+    typer.echo(f"  ERROR              {report.errors}")
+    typer.echo(f"  WARNING            {report.warnings}")
+    typer.echo(f"  INFO               {report.infos}")
+    typer.echo(f"  Sealable           {report.sealable}")
+    typer.echo(f"  Report             {md_path}")
+    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+
+    if report.errors > 0:
+        raise typer.Exit(code=3)
