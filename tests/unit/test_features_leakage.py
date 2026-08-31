@@ -24,29 +24,26 @@ import numpy as np
 import polars as pl
 import pytest
 
-from jarvis.bars import BAR_SCHEMA
 from jarvis.core.types import Nanos
 from jarvis.features import REGISTRY, FeatureDef, LookbackSpec, compute, register
-from jarvis.sessions import load_session_set
 
-# Reused rather than duplicated -- see build_fixture_bars's own docstring.
-from tests.unit.test_features_library import (
-    _multi_day_pre_london,
-    _ns,
-    _row,
-    _weekdays_from,
+# Plain-module import (not a test-to-test import) -- see _feature_fixtures's
+# own docstring for why this must not be `from tests.unit._feature_fixtures`
+# or `from tests.unit.test_features_library import ...` (the latter is what
+# broke collection under a bare `pytest` invocation in the first place).
+from _feature_fixtures import (
+    NS_PER_MINUTE,
+    SESSION_SET as _SESSION_SET,
     build_fixture_bars,
+    frame as _frame,
+    multi_day_pre_london as _multi_day_pre_london,
+    ns as _ns,
+    row as _row,
+    weekdays_from as _weekdays_from,
 )
 
-NS_PER_MINUTE = 60_000_000_000
-
-_SESSION_SET = load_session_set("fx_core", 1)
 _FEATURE_NAMES = sorted(REGISTRY.keys())
 _TRUNCATION_K = 2000  # comfortably < fixture height - 50, and >= atr_bars' n=1440
-
-
-def _frame(rows: list[dict]) -> pl.DataFrame:
-    return pl.DataFrame(rows, schema=BAR_SCHEMA)
 
 
 # ---------------------------------------------------------------------------

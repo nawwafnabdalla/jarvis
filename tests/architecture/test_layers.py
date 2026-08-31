@@ -1,5 +1,3 @@
-import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -31,17 +29,23 @@ _EXPECTED_MODULES = [
 ]
 
 
-def test_import_linter_contracts_pass():
-    lint_imports = shutil.which("lint-imports")
-    if lint_imports is None:
-        pytest.fail("lint-imports executable not found on PATH; install the dev extras")
-    result = subprocess.run(
-        [lint_imports],
-        cwd=repo_root(),
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+def test_import_linter_contracts_pass(capsys):
+    # Calls the same underlying function the `lint-imports` console script
+    # wraps (importlinter.cli.lint_imports, which is a plain function
+    # returning an exit code -- not click-decorated) directly in-process,
+    # rather than shelling out to a script resolved via shutil.which(PATH).
+    # The previous subprocess-based version passed or failed depending on
+    # whether the venv's Scripts/bin directory happened to be on PATH for
+    # the invoking shell, which is a property of how the test was run, not
+    # of the codebase -- exactly the class of flakiness that must not gate
+    # something this test is meant to guarantee unconditionally. An
+    # explicit config_filename makes the result independent of the
+    # process's current working directory too.
+    from importlinter.cli import EXIT_STATUS_SUCCESS, lint_imports
+
+    exit_code = lint_imports(config_filename=str(repo_root() / ".importlinter"))
+    output = capsys.readouterr()
+    assert exit_code == EXIT_STATUS_SUCCESS, output.out + output.err
 
 
 @pytest.mark.parametrize("module_name", _EXPECTED_MODULES)
