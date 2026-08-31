@@ -60,38 +60,51 @@ def fixture_bars() -> pl.DataFrame:
 
 
 def _shuffle_future(bars: pl.DataFrame, k: int, seed: int = 99) -> pl.DataFrame:
-    """Bars at index <= k are untouched. Bars after index k keep their
-    OWN ts_utc_ns (ascending timestamps are a genuine precondition of
-    every feature here, e.g. trading_day_boundaries's searchsorted
-    bucketing -- shuffling the timestamp column itself would test
-    behaviour on malformed input, not leakage) but have their price/
-    provenance columns permuted among themselves and perturbed with
-    noise, so a feature depending on ANY statistic of the future data
-    (not just "the next value") is exercised."""
+    """Bars at index <= k are untouched. Rows are NEVER reordered --
+    ts_utc_ns stays intact and strictly ascending, since compute() and
+    every feature here legitimately rely on it (trading_day_boundaries's
+    searchsorted bucketing, for one); reordering rows would test
+    behaviour on malformed input, not leakage, and any resulting failure
+    would be a phantom unrelated to the property under test.
+
+    Only the PRICE columns (bid/ask O/H/L/C) are randomised, for rows
+    with index > k, plus the derived spread_* columns regenerated from
+    them so the perturbed bars stay internally consistent. tick_count,
+    first_tick_ns, last_tick_ns and prev_gap_ns are left untouched --
+    perturbing prev_gap_ns would change rv_60m's null mask for a reason
+    unrelated to leakage and muddy the signal.
+
+    The property under test is unchanged: no value at index <= k may
+    depend on any price at index > k. This holds even for
+    session_terminal features across the k boundary -- if k falls inside
+    a still-open session window, values at <= k are null and stay null;
+    if k falls after that window's close, the day's terminal value was
+    already fixed by bars at or before the window's end, all of which are
+    at or before k or otherwise untouched here."""
     n = bars.height
     if k + 1 >= n:
         return bars
 
     rng = np.random.default_rng(seed)
-    value_cols = [c for c in BAR_SCHEMA if c != "ts_utc_ns"]
-
     head = bars[: k + 1]
-    tail_ts = bars[k + 1 :].select("ts_utc_ns")
-    tail_values = bars[k + 1 :].select(value_cols)
+    tail = bars[k + 1 :]
 
-    perm = rng.permutation(tail_values.height).tolist()
-    shuffled_values = tail_values[perm]
-
-    noise = rng.normal(0, 0.001, size=shuffled_values.height)
+    noise = rng.normal(0, 0.001, size=tail.height)
     price_cols = ["bid_o", "bid_h", "bid_l", "bid_c", "ask_o", "ask_h", "ask_l", "ask_c"]
-    shuffled_values = shuffled_values.with_columns(
+    perturbed_tail = tail.with_columns(
         [(pl.col(c) + pl.Series(noise)).alias(c) for c in price_cols]
     )
-
-    new_tail = pl.concat([tail_ts, shuffled_values], how="horizontal_extend").select(
-        list(BAR_SCHEMA)
+    perturbed_tail = perturbed_tail.with_columns(
+        [
+            (pl.col("ask_o") - pl.col("bid_o")).alias("spread_open"),
+            pl.max_horizontal(pl.col("ask_h") - pl.col("bid_l"), pl.col("ask_o") - pl.col("bid_o")).alias(
+                "spread_max"
+            ),
+            (pl.col("ask_c") - pl.col("bid_c")).alias("spread_twa"),
+        ]
     )
-    return pl.concat([head, new_tail], how="vertical")
+
+    return pl.concat([head, perturbed_tail], how="vertical")
 
 
 # ---------------------------------------------------------------------------

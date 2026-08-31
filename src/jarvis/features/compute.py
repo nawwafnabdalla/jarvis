@@ -68,7 +68,15 @@ def compute(names: Sequence[str], bars: pl.DataFrame, session_set: SessionSet) -
     computed: dict[str, pl.Series] = {}
     for name in order:
         defn = REGISTRY[name]
-        ctx = FeatureContext(bars=bars, computed=computed, session_set=session_set, params=defn.params)
+        # FeatureContext carries only `params`, not the FeatureDef itself, so
+        # gap_tolerance_ns (a FeatureDef field) is derived into params here
+        # rather than hand-duplicated in each feature's own registration --
+        # FeatureDef.gap_tolerance_ns stays the single source of truth, and a
+        # future edit to it cannot silently fail to reach the compute function.
+        params = dict(defn.params)
+        if defn.gap_tolerance_ns is not None:
+            params["gap_tolerance_ns"] = defn.gap_tolerance_ns
+        ctx = FeatureContext(bars=bars, computed=computed, session_set=session_set, params=params)
         raw = defn.compute(ctx)
         if len(raw) != bars.height:
             raise IntegrityError(

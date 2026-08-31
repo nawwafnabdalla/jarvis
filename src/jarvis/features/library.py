@@ -311,8 +311,11 @@ def rv_60m_compute(ctx: FeatureContext) -> pl.Series:
     """
     n = int(ctx.params["n"])
     # gap_tolerance_ns lives on FeatureDef, not FeatureContext (the compute
-    # interface only threads `params` through) -- duplicated into params so
-    # this function has access to it.
+    # interface only threads `params` through) -- compute.py's orchestration
+    # derives it into params from FeatureDef.gap_tolerance_ns on every call,
+    # so FeatureDef stays the single source of truth (not hand-duplicated
+    # here). A caller invoking this function directly, bypassing compute(),
+    # must still supply it explicitly, same as any other param.
     gap_tolerance_ns = int(ctx.params["gap_tolerance_ns"])
     bars = ctx.bars
     m = bars.height
@@ -357,7 +360,7 @@ register(
         lookback=LookbackSpec("bars", 60),
         gap_tolerance_ns=5 * 60 * 1_000_000_000,
         requires=(),
-        params={"n": 60, "gap_tolerance_ns": 5 * 60 * 1_000_000_000},
+        params={"n": 60},
         leakage_class="causal",
         compute=rv_60m_compute,
     )
