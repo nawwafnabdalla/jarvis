@@ -124,6 +124,12 @@ def _append_bar(
         weights[-1] = minute_end_ns - last_tick_ns
     spread_twa = float(np.sum(spreads * weights) / (minute_end_ns - first_tick_ns))
 
+    # Provisional: threaded only through THIS run's own bars. store.write_bars
+    # recomputes prev_gap_ns as a pure function of the full stored (merged,
+    # sorted) frame before writing, so this value is only ever correct on
+    # its own when this run happens to be the only data ever written for
+    # the month -- it is not relied upon to survive a merge with another
+    # run's bars (WP-005-CORRECTION).
     prev_gap_ns = None if prev_last_tick_ns is None else first_tick_ns - prev_last_tick_ns
 
     acc["ts_utc_ns"].append(minute_start_ns)

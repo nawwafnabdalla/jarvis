@@ -53,6 +53,21 @@ def bars_path(repo_root: Path, instrument: str, year: int, month: int) -> Path:
     )
 
 
+def _recompute_prev_gap_ns(frame: pl.DataFrame) -> pl.DataFrame:
+    """prev_gap_ns as a pure function of the (sorted) stored frame:
+    first_tick_ns[i] - last_tick_ns[i-1], null for row 0. Recomputed here
+    rather than trusting whatever a single resample run threaded through
+    -- WP-005-CORRECTION: a resample run only knows the bar that preceded
+    it WITHIN THAT RUN, which is wrong (or a spurious null) the moment two
+    separate runs' output is merged into one month file, regardless of
+    which order they were resampled in. `.shift(1)` gives a null in row 0
+    automatically, which then propagates through the subtraction -- no
+    special-casing needed."""
+    return frame.with_columns(
+        (pl.col("first_tick_ns") - pl.col("last_tick_ns").shift(1)).alias("prev_gap_ns")
+    )
+
+
 def write_bars(
     repo_root: Path, instrument: str, year: int, month: int, frame: pl.DataFrame
 ) -> Path:
@@ -60,17 +75,40 @@ def write_bars(
     directory, then os.replace() -- same pattern and reasoning as the
     fetch log).
 
-    Deterministic: resampling the same input twice produces byte-identical
-    files WITHIN one environment (same polars/pyarrow versions). This is
-    NOT guaranteed across library versions -- Parquet embeds a
-    `created_by` string carrying the writer version. The dataset manifest
-    (Stage 1B) records library versions for exactly this reason.
+    MERGES with any existing month file rather than replacing it (WP-005-
+    CORRECTION: replacing silently destroyed every previously-resampled
+    hour in the same month whenever a later call only covered part of
+    it). Existing rows and `frame`'s rows are concatenated, deduplicated
+    on ts_utc_ns keeping `frame`'s row for any collision (a re-resample of
+    the same minute must win over what was stored before), sorted
+    ascending by ts_utc_ns, and prev_gap_ns is recomputed for the entire
+    merged result -- see _recompute_prev_gap_ns.
+
+    Deterministic: writing the same logical content twice produces
+    byte-identical files WITHIN one environment (same polars/pyarrow
+    versions) -- this holds whether that content arrived in one call or
+    was assembled by merging several. This is NOT guaranteed across
+    library versions -- Parquet embeds a `created_by` string carrying the
+    writer version. The dataset manifest (Stage 1B) records library
+    versions for exactly this reason.
     """
     path = bars_path(repo_root, instrument, year, month)
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.is_file():
+        existing = pl.read_parquet(path)
+        combined = pl.concat([existing, frame])
+    else:
+        combined = frame
+
+    merged = combined.unique(subset=["ts_utc_ns"], keep="last", maintain_order=True).sort(
+        "ts_utc_ns"
+    )
+    merged = _recompute_prev_gap_ns(merged)
+
     tmp_path = path.with_name(path.name + ".tmp")
     try:
-        frame.write_parquet(tmp_path, **_WRITE_PARQUET_KWARGS)
+        merged.write_parquet(tmp_path, **_WRITE_PARQUET_KWARGS)
         os.replace(tmp_path, path)
     except OSError as exc:
         tmp_path.unlink(missing_ok=True)

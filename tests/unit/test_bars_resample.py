@@ -7,9 +7,10 @@ import polars as pl
 import pytest
 
 from jarvis.core.errors import IntegrityError, UserError
+from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.bars.resample import NS_PER_MINUTE, resample_range
-from jarvis.bars.store import read_bars
+from jarvis.bars.store import bars_path, read_bars
 from jarvis.ingest.urls import NS_PER_HOUR, raw_blob_path
 
 _RECORD_STRUCT = struct.Struct(">IIIff")
@@ -40,6 +41,21 @@ def repo(isolated_repo: Path) -> Path:
         "GBPUSD:\n  point_scale: 1.0e-5\n  digits: 5\n", encoding="utf-8"
     )
     return isolated_repo
+
+
+def _make_repo(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch, label: str) -> Path:
+    """A second, independently-isolated repo root, for tests that need to
+    compare two separate resample histories against each other. Leaves
+    `jarvis.core.config.repo_root` pointed at the returned path; callers
+    doing further work against a DIFFERENT repo afterward must repatch it."""
+    root = tmp_path_factory.mktemp(label)
+    (root / "pyproject.toml").write_text("", encoding="utf-8")
+    (root / "config").mkdir()
+    (root / "config" / "instruments.yaml").write_text(
+        "GBPUSD:\n  point_scale: 1.0e-5\n  digits: 5\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("jarvis.core.config.repo_root", lambda: root)
+    return root
 
 
 # Acceptance 2: absent-minute semantics -----------------------------------
@@ -359,3 +375,126 @@ def test_bars_span_month_boundary_written_to_two_files(repo: Path):
     df = read_bars(repo, "GBPUSD", hour_jan, Nanos(hour_feb + NS_PER_HOUR)).sort("ts_utc_ns")
     assert df.height == 2
     assert df["ts_utc_ns"].to_list() == [hour_jan, hour_feb]
+
+
+# WP-005-CORRECTION: write_bars merge semantics ------------------------------
+
+
+def test_resampling_second_day_preserves_first(repo: Path):
+    day1_hour = _hour_ns(2024, 1, 15, 3)
+    day2_hour = _hour_ns(2024, 1, 16, 3)
+    _write_blob(repo, "GBPUSD", day1_hour, [(0, 100000, 99900, 1.0, 1.0)])
+    _write_blob(repo, "GBPUSD", day2_hour, [(0, 100010, 99910, 1.0, 1.0)])
+
+    resample_range(repo, "GBPUSD", day1_hour, Nanos(day1_hour + NS_PER_HOUR))
+    resample_range(repo, "GBPUSD", day2_hour, Nanos(day2_hour + NS_PER_HOUR))
+
+    df = read_bars(repo, "GBPUSD", day1_hour, Nanos(day2_hour + NS_PER_HOUR)).sort("ts_utc_ns")
+    assert df.height == 2
+    assert df["ts_utc_ns"].to_list() == [day1_hour, day2_hour]
+
+
+def test_reresampling_same_range_is_idempotent(repo: Path):
+    hour = _hour_ns(2024, 1, 15, 3)
+    _write_blob(
+        repo,
+        "GBPUSD",
+        hour,
+        [(0, 100000, 99900, 1.0, 1.0), (60_000, 100010, 99910, 1.0, 1.0)],
+    )
+
+    resample_range(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+    path = bars_path(repo, "GBPUSD", 2024, 1)
+    hash_a = sha256_file(path)
+
+    resample_range(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+    hash_b = sha256_file(path)
+
+    assert hash_a == hash_b
+    df = read_bars(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+    assert df.height == 2  # no duplicate rows accumulated
+
+
+def test_reresample_overwrites_changed_minute(repo: Path):
+    hour = _hour_ns(2024, 1, 15, 3)
+    _write_blob(repo, "GBPUSD", hour, [(0, 100000, 99900, 1.0, 1.0)])
+    resample_range(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+
+    # Same minute, different prices -- as if the raw blob had been re-fetched.
+    _write_blob(repo, "GBPUSD", hour, [(0, 200000, 199900, 1.0, 1.0)])
+    resample_range(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+
+    df = read_bars(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+    assert df.height == 1
+    row = df.row(0, named=True)
+    assert row["ask_o"] == pytest.approx(2.00000, abs=1e-9)
+    assert row["bid_o"] == pytest.approx(1.99900, abs=1e-9)
+
+
+def test_prev_gap_ns_correct_across_merge(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    day1_hour = _hour_ns(2024, 1, 15, 3)
+    day2_hour = _hour_ns(2024, 1, 16, 3)
+    _write_blob(repo, "GBPUSD", day1_hour, [(3_599_000, 100000, 99900, 1.0, 1.0)])
+    _write_blob(repo, "GBPUSD", day2_hour, [(500, 100010, 99910, 1.0, 1.0)])
+
+    # Resample day 16 FIRST, then day 15 (out of order) -- each call only
+    # covers its own single hour, so no hole is involved.
+    resample_range(repo, "GBPUSD", day2_hour, Nanos(day2_hour + NS_PER_HOUR))
+    resample_range(repo, "GBPUSD", day1_hour, Nanos(day1_hour + NS_PER_HOUR))
+    merged_df = read_bars(
+        repo, "GBPUSD", day1_hour, Nanos(day2_hour + NS_PER_HOUR)
+    ).sort("ts_utc_ns")
+
+    # Reference: the whole span resampled in a single pass, in a separate
+    # repo (allow_incomplete=True since the 22 hours between day1_hour and
+    # day2_hour have no blob at all in this scenario).
+    other_repo = _make_repo(tmp_path_factory, monkeypatch, "single_pass")
+    _write_blob(other_repo, "GBPUSD", day1_hour, [(3_599_000, 100000, 99900, 1.0, 1.0)])
+    _write_blob(other_repo, "GBPUSD", day2_hour, [(500, 100010, 99910, 1.0, 1.0)])
+    resample_range(
+        other_repo,
+        "GBPUSD",
+        day1_hour,
+        Nanos(day2_hour + NS_PER_HOUR),
+        allow_incomplete=True,
+    )
+    single_pass_df = read_bars(
+        other_repo, "GBPUSD", day1_hour, Nanos(day2_hour + NS_PER_HOUR)
+    ).sort("ts_utc_ns")
+
+    assert merged_df.height == single_pass_df.height == 2
+    assert merged_df["prev_gap_ns"].to_list() == single_pass_df["prev_gap_ns"].to_list()
+    assert merged_df["prev_gap_ns"].to_list()[0] is None
+    assert merged_df["prev_gap_ns"].to_list()[1] is not None
+
+
+def test_merged_output_matches_single_pass(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+):
+    """The property that actually matters: how the same logical range was
+    split across resample_range calls must not affect the stored result."""
+    day1_hour = _hour_ns(2024, 1, 15, 3)
+    day2_hour = _hour_ns(2024, 1, 16, 3)
+
+    one_call_repo = _make_repo(tmp_path_factory, monkeypatch, "one_call")
+    _write_blob(one_call_repo, "GBPUSD", day1_hour, [(0, 100000, 99900, 1.0, 1.0)])
+    _write_blob(one_call_repo, "GBPUSD", day2_hour, [(0, 100010, 99910, 1.0, 1.0)])
+    resample_range(
+        one_call_repo,
+        "GBPUSD",
+        day1_hour,
+        Nanos(day2_hour + NS_PER_HOUR),
+        allow_incomplete=True,
+    )
+    hash_a = sha256_file(bars_path(one_call_repo, "GBPUSD", 2024, 1))
+
+    two_call_repo = _make_repo(tmp_path_factory, monkeypatch, "two_calls")
+    _write_blob(two_call_repo, "GBPUSD", day1_hour, [(0, 100000, 99900, 1.0, 1.0)])
+    _write_blob(two_call_repo, "GBPUSD", day2_hour, [(0, 100010, 99910, 1.0, 1.0)])
+    resample_range(two_call_repo, "GBPUSD", day1_hour, Nanos(day1_hour + NS_PER_HOUR))
+    resample_range(two_call_repo, "GBPUSD", day2_hour, Nanos(day2_hour + NS_PER_HOUR))
+    hash_b = sha256_file(bars_path(two_call_repo, "GBPUSD", 2024, 1))
+
+    assert hash_a == hash_b
