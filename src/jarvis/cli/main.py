@@ -7,16 +7,20 @@ import sys
 import time
 from datetime import datetime, timezone
 
+import polars as pl
 import typer
 
 from jarvis.bars.resample import resample_range
+from jarvis.bars.store import read_bars
 from jarvis.core.config import load_instruments, load_periods, repo_root
 from jarvis.core.errors import ConfigError, JarvisError, UserError
 from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
+from jarvis.features import REGISTRY, compute, write_features
 from jarvis.ingest.fetch import ingest_range
 from jarvis.ingest.urls import NS_PER_HOUR
 from jarvis.qa.report import run_checks, write_report
+from jarvis.sessions import load_session_set
 
 app = typer.Typer(name="jarvis")
 
@@ -124,6 +128,9 @@ def doctor() -> None:
 
 data_app = typer.Typer(name="data", help="Market data ingestion and validation.")
 app.add_typer(data_app, name="data")
+
+features_app = typer.Typer(name="features", help="Feature computation.")
+app.add_typer(features_app, name="features")
 
 _INSTRUMENT = "GBPUSD"
 
@@ -284,3 +291,60 @@ def data_validate(
 
     if report.errors > 0:
         raise typer.Exit(code=3)
+
+
+@features_app.command("build")
+def features_build(
+    from_: str = typer.Option(..., "--from", help="ISO 8601 UTC, hour-aligned"),
+    to: str = typer.Option(..., "--to", help="ISO 8601 UTC, hour-aligned, exclusive"),
+    features: str = typer.Option(
+        None,
+        "--features",
+        help="Comma-separated feature names to compute; default is every registered feature.",
+    ),
+) -> None:
+    """Compute features over bars in the given UTC range (loaded via
+    bars.read_bars in this CLI layer -- jarvis.features itself never
+    opens Parquet) and write them, month by month, with the same merge
+    semantics as bars.store.write_bars (D-045)."""
+    try:
+        start_ns = _parse_iso_utc_ns(from_, option_name="--from")
+        end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        root = repo_root()
+        names = tuple(n.strip() for n in features.split(",")) if features else tuple(REGISTRY)
+
+        bars_df = read_bars(root, _INSTRUMENT, start_ns, end_ns)
+        if bars_df.height == 0:
+            typer.echo("No bars in range; nothing to compute.")
+            raise typer.Exit(code=0)
+
+        session_set = load_session_set("fx_core", 1)
+
+        started = time.perf_counter()
+        result = compute(names, bars_df, session_set)
+
+        dated = result.frame.with_columns(
+            pl.from_epoch(pl.col("ts_utc_ns"), time_unit="ns").alias("_dt")
+        ).with_columns(
+            [
+                pl.col("_dt").dt.year().alias("_year"),
+                pl.col("_dt").dt.month().alias("_month"),
+            ]
+        )
+        months_written: list[str] = []
+        for (year, month), month_frame in dated.group_by(["_year", "_month"], maintain_order=True):
+            write_features(root, _INSTRUMENT, year, month, month_frame.drop(["_dt", "_year", "_month"]))
+            months_written.append(f"{year:04d}-{month:02d}")
+        elapsed = time.perf_counter() - started
+    except JarvisError as exc:
+        typer.echo(f"jarvis features build: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc
+
+    typer.echo()
+    typer.echo(f"  Bars               {bars_df.height}")
+    typer.echo(f"  Feature set        v{result.feature_set_version}")
+    typer.echo(f"  Months written     {', '.join(months_written)}")
+    typer.echo("  Null counts:")
+    for name in result.feature_names:
+        typer.echo(f"    {name:<24} {result.null_counts[name]}")
+    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
