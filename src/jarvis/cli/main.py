@@ -19,6 +19,14 @@ from jarvis.core.types import Nanos
 from jarvis.features import REGISTRY, compute, write_features
 from jarvis.ingest.fetch import ingest_range
 from jarvis.ingest.urls import NS_PER_HOUR
+from jarvis.probe.report import (
+    VAULT_BOUNDARY_NS,
+    has_prior_widening,
+    read_lineage,
+    record_lineage_run,
+    run_probe,
+)
+from jarvis.probe.report import write_report as write_stage0_report
 from jarvis.qa.report import run_checks, write_report
 from jarvis.sessions import load_session_set
 
@@ -131,6 +139,9 @@ app.add_typer(data_app, name="data")
 
 features_app = typer.Typer(name="features", help="Feature computation.")
 app.add_typer(features_app, name="features")
+
+stage0_app = typer.Typer(name="stage0", help="Stage 0 feasibility probe.")
+app.add_typer(stage0_app, name="stage0")
 
 _INSTRUMENT = "GBPUSD"
 
@@ -348,3 +359,77 @@ def features_build(
     for name in result.feature_names:
         typer.echo(f"    {name:<24} {result.null_counts[name]}")
     typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+
+
+@stage0_app.command("probe")
+def stage0_probe(
+    from_: str = typer.Option(..., "--from", help="ISO 8601 UTC, hour-aligned"),
+    to: str = typer.Option(..., "--to", help="ISO 8601 UTC, hour-aligned, exclusive"),
+    widen: str = typer.Option(
+        None,
+        "--widen",
+        help="Relax exactly one parameter and re-run: range_pct_max or break_buffer_atr.",
+    ),
+) -> None:
+    """Run the Stage 0 feasibility probe (EXPLORATORY -- FREQUENCY ONLY --
+    NOT EVIDENCE OF PREDICTIVE VALUE) and write a report. Refuses any
+    range touching 2023-01-01 or later -- the vault is untouched, even
+    for Stage 0's own descriptive purposes (PDLA-03/D-021). Exit 0 on
+    PROCEED_*, exit 3 on WIDEN_CONTEXT / CONSIDER_EURUSD_FALLBACK /
+    INSUFFICIENT_DATA."""
+    try:
+        start_ns = _parse_iso_utc_ns(from_, option_name="--from")
+        end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        if end_ns >= VAULT_BOUNDARY_NS:
+            raise UserError(
+                f"--to ({to}) is at or beyond the vault boundary "
+                "(2023-01-01T00:00:00Z) -- Stage 0 runs on 2007-2022 only "
+                "(PDLA-03/D-021); the vault is untouched, including for "
+                "descriptive purposes"
+            )
+        root = repo_root()
+
+        prior_runs = read_lineage(root, _INSTRUMENT, start_ns, end_ns)
+        if widen is not None and has_prior_widening(prior_runs):
+            raise UserError(
+                f"a widening has already been attempted for this run lineage "
+                f"({len(prior_runs)} prior run(s) recorded for "
+                f"{_INSTRUMENT} {from_}->{to}) -- only one widening is permitted; "
+                "repeated widening until the gate passes is parameter mining"
+            )
+
+        typer.echo(f"Stage 0 probe  {_INSTRUMENT}  {from_} -> {to}  (widen={widen})")
+
+        started = time.perf_counter()
+        gate_result, events = run_probe(root, _INSTRUMENT, start_ns, end_ns, widen=widen)
+        elapsed = time.perf_counter() - started
+
+        record_lineage_run(
+            root, _INSTRUMENT, start_ns, end_ns, widened_from=widen, decision=gate_result.decision
+        )
+
+        session_set = load_session_set("fx_core", 1)
+        md_path, _parquet_path = write_stage0_report(
+            root,
+            _INSTRUMENT,
+            start_ns,
+            end_ns,
+            session_set,
+            gate_result,
+            events,
+            prior_run_count=len(prior_runs),
+        )
+    except JarvisError as exc:
+        typer.echo(f"jarvis stage0 probe: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc
+
+    typer.echo()
+    typer.echo(f"  Decision           {gate_result.decision}")
+    typer.echo(f"  Median annual (M)  {gate_result.median_annual}")
+    typer.echo(f"  P10 annual         {gate_result.p10_annual}")
+    typer.echo(f"  Narrowest          {gate_result.narrowest_intersection}")
+    typer.echo(f"  Report             {md_path}")
+    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+
+    if gate_result.decision not in ("PROCEED_GBPUSD", "PROCEED_GBPUSD_WITH_INSTABILITY_WARNING"):
+        raise typer.Exit(code=3)
