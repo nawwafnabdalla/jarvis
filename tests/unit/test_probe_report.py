@@ -263,27 +263,53 @@ def test_vault_boundary_is_2023_01_01():
     assert VAULT_BOUNDARY_NS == _ns(2023, 1, 1)
 
 
-# CLI vault-boundary refusal (acceptance criterion 7) ------------------------
+# CLI vault-boundary refusal (acceptance criterion 7, corrected) ------------
+#
+# WP-008-CORRECTION: end_ns is an EXCLUSIVE upper bound (this project's
+# [start, end) convention since WP-001). --to 2023-01-01T00:00:00Z is
+# therefore the boundary ITSELF and must be ACCEPTED -- it reads through
+# 2022-12-31T23:59:59.999999999Z and touches no vault data, exactly
+# PDLA-03/D-021's intent. An earlier `>=` check refused this value,
+# silently making 2022-12-31 permanently unreachable.
 
 
-def test_cli_refuses_to_beyond_2022(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_vault_boundary_is_exclusive_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     from typer.testing import CliRunner
 
     from jarvis.cli.main import app
 
     monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: tmp_path)
     runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "stage0",
-            "probe",
-            "--from",
-            "2007-01-01T00:00:00+00:00",
-            "--to",
-            "2023-01-01T00:00:00+00:00",
-        ],
-    )
-    assert result.exit_code != 0
-    assert "vault boundary" in result.output
-    assert "2023-01-01" in result.output
+
+    def run(to: str):
+        return runner.invoke(
+            app, ["stage0", "probe", "--from", "2007-01-01T00:00:00+00:00", "--to", to]
+        )
+
+    # The boundary itself: ACCEPTED by the vault-boundary check. tmp_path
+    # has no data, so the run still fails overall -- but for "no bars",
+    # never for "vault boundary".
+    at_boundary = run("2023-01-01T00:00:00+00:00")
+    assert "vault boundary" not in at_boundary.output
+    assert at_boundary.exit_code != 0
+    assert "no bars" in at_boundary.output
+
+    # One hour past the boundary: REFUSED.
+    past_boundary = run("2023-01-01T01:00:00+00:00")
+    assert past_boundary.exit_code != 0
+    assert "vault boundary" in past_boundary.output
+
+    # Well past the boundary: REFUSED.
+    far_past_boundary = run("2023-06-01T00:00:00+00:00")
+    assert far_past_boundary.exit_code != 0
+    assert "vault boundary" in far_past_boundary.output
+
+
+def test_last_readable_instant_is_2022_12_31():
+    """With --to 2023-01-01T00:00:00Z, the last representable instant in
+    the half-open range (end_ns - 1) must fall on 2022-12-31 -- so the
+    2022-12-31 exclusion bug (WP-008-CORRECTION) can never silently
+    reappear."""
+    last_instant_ns = VAULT_BOUNDARY_NS - 1
+    last_instant = datetime.fromtimestamp(last_instant_ns // 1_000_000_000, tz=timezone.utc)
+    assert last_instant.date() == date(2022, 12, 31)

@@ -380,12 +380,16 @@ def stage0_probe(
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
-        if end_ns >= VAULT_BOUNDARY_NS:
+        # Strict >: end_ns is an EXCLUSIVE upper bound (this project's
+        # [start, end) convention since WP-001), so --to
+        # 2023-01-01T00:00:00Z reads through 2022-12-31T23:59:59.999999999Z
+        # and touches no vault data -- it must be ALLOWED, not refused.
+        if end_ns > VAULT_BOUNDARY_NS:
             raise UserError(
-                f"--to ({to}) is at or beyond the vault boundary "
-                "(2023-01-01T00:00:00Z) -- Stage 0 runs on 2007-2022 only "
-                "(PDLA-03/D-021); the vault is untouched, including for "
-                "descriptive purposes"
+                f"--to ({to}) exceeds the vault boundary (2023-01-01T00:00:00Z) "
+                "-- --to must not exceed 2023-01-01T00:00:00Z (exclusive). "
+                "Stage 0 runs on 2007-2022 only (PDLA-03/D-021); the vault is "
+                "untouched, including for descriptive purposes"
             )
         root = repo_root()
 

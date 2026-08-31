@@ -320,23 +320,23 @@ def run_probe(
         raise UserError(f"start_ns ({start_ns}) and end_ns ({end_ns}) must both be hour-aligned")
     if start_ns >= end_ns:
         raise UserError(f"start_ns ({start_ns}) must be strictly before end_ns ({end_ns})")
-    # >=, not >: acceptance criterion 7 requires refusing a --to of
-    # exactly 2023-01-01T00:00:00Z. Under this project's established
-    # half-open-exclusive [start, end) convention (matching data fetch/
-    # resample/validate and features build), 2023-01-01T00:00:00Z as an
-    # EXCLUSIVE end would capture all of 2022 without reading a single
-    # 2023 bar -- so a strict `>` here would be the more internally
-    # consistent boundary, and would still keep the CLI's own example
-    # (`--to 2022-12-31`) working as probably intended (through end of
-    # 2022). `>=` is what the acceptance criterion asks for, so that is
-    # what is implemented; flagged as a real spec tension in closing
-    # notes rather than silently resolved either way.
-    if end_ns >= VAULT_BOUNDARY_NS:
+    # Strict >, not >=: end_ns is an EXCLUSIVE upper bound, matching this
+    # project's [start, end) convention since WP-001 (data fetch/resample/
+    # validate, features build). end_ns == VAULT_BOUNDARY_NS
+    # (2023-01-01T00:00:00Z) therefore reads through
+    # 2022-12-31T23:59:59.999999999Z and touches no vault data -- exactly
+    # PDLA-03/D-021's intent. WP-008-CORRECTION: an earlier `>=` here made
+    # 2022-12-31 permanently unreachable (silently dropping one trading
+    # day, on the P10 leg that is deliberately the most sensitive to the
+    # worst year) to satisfy a literally-read acceptance criterion that
+    # was itself in error; the criterion has been corrected instead.
+    if end_ns > VAULT_BOUNDARY_NS:
         raise UserError(
-            f"end_ns ({end_ns}) is at or beyond the vault boundary "
-            f"({VAULT_BOUNDARY_NS}, 2023-01-01T00:00:00Z) -- Stage 0 runs on "
-            "2007-2022 only (PDLA-03/D-021); the vault is untouched, including "
-            "for descriptive purposes"
+            f"end_ns ({end_ns}) exceeds the vault boundary "
+            f"({VAULT_BOUNDARY_NS}, 2023-01-01T00:00:00Z) -- --to must not exceed "
+            "2023-01-01T00:00:00Z (exclusive). Stage 0 runs on 2007-2022 only "
+            "(PDLA-03/D-021); the vault is untouched, including for descriptive "
+            "purposes"
         )
 
     params = widened_params(widen)
@@ -414,6 +414,13 @@ def _render_markdown(
 
     # 4. Per-year table.
     lines.append("## Per-year counts")
+    lines.append("")
+    lines.append(
+        "\"Admissible days\" is a calendar denominator -- the count of weekday "
+        "trading-day labels in that calendar year -- reported for every year "
+        "shown here regardless of whether the year itself passed admissibility; "
+        "it is not \"days that passed admissibility\" and must not be read as one."
+    )
     lines.append("")
     header = (
         "| Year | Admissible | Admissible days | Context-eligible days | "
