@@ -155,7 +155,15 @@ def write_import_log(
     hist_month: HistDataMonth,
     *,
     declared_gaps: int,
+    convention_source: str,
 ) -> Path:
+    """`convention_source` is `"detected"` when this month's own content
+    provided discriminating evidence, or `"carried_from_{YYYY-MM}"` when
+    it had none and inherited the convention from another month in the
+    same import run (WP-009-CORRECTION: a month whose convention was
+    assumed rather than proven must be visibly distinguishable from one
+    that was verified, since a carried hint is exactly what would mask a
+    changeover landing mid-winter)."""
     path = import_log_path(repo_root, instrument, hist_month.year, hist_month.month)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -166,6 +174,9 @@ def write_import_log(
         "source_sha256": hist_month.source_sha256,
         "convention": hist_month.convention,
         "convention_evidence": hist_month.convention_evidence,
+        "convention_source": convention_source,
+        "column_order": hist_month.column_order,
+        "column_order_evidence": hist_month.column_order_evidence,
         "row_count": hist_month.row_count,
         "declared_gaps": declared_gaps,
         "recorded_utc": _utc_now_iso(),
@@ -397,6 +408,12 @@ def import_histdata(
         # evidence always wins when it exists (detect_tz_convention's own
         # rule), so this never overrides what a file actually says.
         last_verified_convention: TzConvention | None = None
+        # The month key that ACTUALLY detected last_verified_convention
+        # from real evidence -- kept separate from last_verified_convention
+        # itself so a chain of hint-only months all point back to the one
+        # month that was genuinely verified, rather than diluting into
+        # "carried from a month that was itself only carried."
+        last_verified_source_key: str | None = None
 
         for candidate in candidates:
             key = _month_key(candidate.year, candidate.month)
@@ -418,12 +435,36 @@ def import_histdata(
             hist_month = parse_histdata_csv(
                 src.csv_path, instrument, src.year, src.month, convention_hint=last_verified_convention
             )
-            last_verified_convention = hist_month.convention
+            # detect_tz_convention tags its own hint-fallback branch with
+            # this exact substring -- checking for it (rather than e.g.
+            # comparing to last_verified_convention, which would also be
+            # true when a month happens to independently detect the same
+            # convention it would have been hinted) is what distinguishes
+            # "this month's own content proved it" from "no evidence, fell
+            # back to a hint."
+            used_hint = "convention_hint=" in hist_month.convention_evidence
+            if used_hint:
+                convention_source = (
+                    f"carried_from_{last_verified_source_key}"
+                    if last_verified_source_key is not None
+                    else "carried_from_unknown"
+                )
+            else:
+                convention_source = "detected"
+                last_verified_convention = hist_month.convention
+                last_verified_source_key = key
+
             frame = _histdata_month_to_frame(hist_month)
             write_ticks(repo_root, instrument, src.year, src.month, frame)
 
             declared_gaps = parse_gap_report(src.gap_text) if src.gap_text is not None else 0
-            write_import_log(repo_root, instrument, hist_month, declared_gaps=declared_gaps)
+            write_import_log(
+                repo_root,
+                instrument,
+                hist_month,
+                declared_gaps=declared_gaps,
+                convention_source=convention_source,
+            )
 
             months_imported += 1
             total_ticks += hist_month.row_count

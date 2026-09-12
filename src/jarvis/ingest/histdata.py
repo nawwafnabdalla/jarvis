@@ -37,13 +37,34 @@ from jarvis.timeengine import is_ambiguous, is_nonexistent, local_to_utc_ns
 NS_PER_HOUR = 3_600_000_000_000
 NS_PER_MINUTE = 60_000_000_000
 NS_PER_SECOND = 1_000_000_000
-_GAP_THRESHOLD_NS = NS_PER_HOUR  # "a gap > 1 hour" per spec
+# WP-009-CORRECTION: a > 1 hour threshold fires on ordinary intraday data
+# holes (HistData's own .txt reports routinely show 60-150s gaps, and
+# occasionally much larger ones from feed outages), not just genuine
+# weekend closures -- confirmed against real 2023-05 data, which has 135
+# intraday gaps over an hour but only 4 real weekend closes. A real
+# weekend is ~48h (Fri 17:00 NY to Sun 17:00 NY); 40h has comfortable
+# margin below that while sitting far above any plausible intraday hole.
+WEEKEND_GAP_MIN_NS = 40 * NS_PER_HOUR
 _FRIDAY = 4  # Python's date.weekday(): Monday=0 .. Sunday=6
+_MAX_PLAUSIBLE_FRIDAY_CLOSES = 6  # a normal month has 4 or 5; see detect_tz_convention
 _AMBIGUOUS_CORRECTION_WARN_THRESHOLD = 10  # "a handful" -- see module docstring
 
 TzConvention = Literal["ny_local", "fixed_utc_minus_5"]
+ColumnOrder = Literal["bid_ask", "ask_bid"]
 
 _TS_RE = re.compile(r"^\d{8} \d{9}$")
+
+# WP-009-CORRECTION finding 2: real HistData exports for 2006-09 through
+# 2009-04 have their price columns as (ask, bid), not the documented
+# (bid, ask) -- confirmed 100% inverted (col2 > col3) across every row of
+# every one of those months, a clean transition month in 2009-05, and the
+# documented order from 2009-06 onward. A spread is positive by
+# definition (ask > bid) on essentially every tick, so the fraction of
+# rows with col2 > col3 is decisive; 1% tolerance absorbs genuine
+# zero-spread thin quotes (observed: 5 rows out of 554,877 in a clean
+# 2009-11 file) without letting a genuinely mixed file through.
+_COLUMN_ORDER_HIGH_THRESHOLD = 0.99
+_COLUMN_ORDER_LOW_THRESHOLD = 0.01
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,12 +74,56 @@ class HistDataMonth:
     month: int
     convention: TzConvention
     convention_evidence: str  # human-readable, goes in the import report
+    column_order: ColumnOrder
+    column_order_evidence: str  # human-readable, goes in the import report
     ts_utc_ns: np.ndarray  # int64, ascending
     bid: np.ndarray  # float64
     ask: np.ndarray  # float64
     row_count: int
     source_path: Path
     source_sha256: str
+
+
+def detect_column_order(col2: np.ndarray, col3: np.ndarray) -> tuple[ColumnOrder, str]:
+    """Determine whether a file's second and third CSV columns are
+    (bid, ask) -- the documented order -- or (ask, bid).
+
+    A spread is positive by definition: ask > bid on essentially every
+    tick. The fraction of rows with col2 > col3 is therefore decisive:
+      <= 1%  -> "bid_ask"  (col2 is bid, the documented order)
+      >= 99% -> "ask_bid"  (col2 is ask)
+      otherwise -> IntegrityError naming the exact fraction: the file is
+        internally inconsistent between the two orders and cannot be
+        imported safely under either interpretation -- this needs a
+        human decision, not a guess.
+
+    Returns the order plus a one-line evidence string giving the
+    fraction and row count."""
+    n = len(col2)
+    if n == 0:
+        raise IntegrityError("detect_column_order: no rows to evaluate")
+
+    frac_col2_gt_col3 = float(np.count_nonzero(col2 > col3)) / n
+
+    if frac_col2_gt_col3 <= _COLUMN_ORDER_LOW_THRESHOLD:
+        return (
+            "bid_ask",
+            f"{frac_col2_gt_col3:.4f} of {n} rows have col2 > col3 -- "
+            "documented (bid, ask) column order",
+        )
+    if frac_col2_gt_col3 >= _COLUMN_ORDER_HIGH_THRESHOLD:
+        return (
+            "ask_bid",
+            f"{frac_col2_gt_col3:.4f} of {n} rows have col2 > col3 -- "
+            "column order is (ask, bid), not the documented (bid, ask)",
+        )
+
+    raise IntegrityError(
+        f"internally inconsistent column order: {frac_col2_gt_col3:.4f} of {n} rows "
+        "have col2 > col3 (neither >= 0.99 nor <= 0.01) -- this file cannot be "
+        "imported safely under either (bid, ask) or (ask, bid); requires a human "
+        "decision, not an automatic guess"
+    )
 
 
 def _naive_ns(y: int, mo: int, d: int, h: int = 0, mi: int = 0, s: int = 0, ms: int = 0) -> int:
@@ -93,16 +158,21 @@ def detect_tz_convention(
     `local_stamps` is the naive-as-UTC nanosecond representation (see
     _naive_ns) of every tick's local wall-clock stamp, ascending.
 
-    Method: find every Friday weekend close (a gap > 1 hour where the
-    preceding tick is on a Friday). For Fridays falling in an EDT period
-    (determined from jarvis.timeengine's real America/New_York rules,
-    never from the file's own content):
+    Method: find every Friday weekend close (a gap >= WEEKEND_GAP_MIN_NS,
+    40 hours, where the preceding tick is on a Friday -- NOT merely
+    "> 1 hour": ordinary intraday data holes routinely exceed an hour and
+    must never be mistaken for a weekend closure). For Fridays falling in
+    an EDT period (determined from jarvis.timeengine's real
+    America/New_York rules, never from the file's own content):
       close stamp 16:xx -> ny_local
       close stamp 15:xx -> fixed_utc_minus_5
     EST Fridays are NOT discriminating (both conventions give 16:xx) and
     are ignored rather than counted as evidence.
 
     Raises IntegrityError if:
+      - more than _MAX_PLAUSIBLE_FRIDAY_CLOSES (6) Friday closes are found
+        at all -- a normal month has 4 or 5; more means the file has
+        structural problems and any evidence drawn from it is suspect
       - the file is internally mixed (some EDT Fridays 16:xx, others 15:xx)
       - there are no discriminating Fridays AND no convention was supplied
         by the caller (convention_hint)
@@ -112,16 +182,18 @@ def detect_tz_convention(
     n = len(local_stamps)
     ny_local_evidence: list[str] = []
     fixed_evidence: list[str] = []
+    friday_close_count = 0
 
     if n >= 2:
         gaps = np.diff(local_stamps)
-        gap_positions = np.nonzero(gaps > _GAP_THRESHOLD_NS)[0]
+        gap_positions = np.nonzero(gaps >= WEEKEND_GAP_MIN_NS)[0]
         for idx in gap_positions:
             close_ns = int(local_stamps[idx])
             close_dt = datetime.fromtimestamp(close_ns // NS_PER_SECOND, tz=timezone.utc)
             close_date = close_dt.date()
             if close_date.weekday() != _FRIDAY:
                 continue
+            friday_close_count += 1
 
             is_edt = _ny_offset_ns(close_date) == -4 * NS_PER_HOUR
             if not is_edt:
@@ -137,6 +209,14 @@ def detect_tz_convention(
             # any other hour is not a recognisable weekend-close pattern
             # for either convention and is silently not counted -- it is
             # not evidence of anything, not a contradiction.
+
+    if friday_close_count > _MAX_PLAUSIBLE_FRIDAY_CLOSES:
+        raise IntegrityError(
+            f"{year:04d}-{month:02d}: found {friday_close_count} Friday weekend "
+            f"closes (gaps >= {WEEKEND_GAP_MIN_NS // NS_PER_HOUR}h) -- a normal "
+            f"month has 4 or 5; more than {_MAX_PLAUSIBLE_FRIDAY_CLOSES} means this "
+            "file has structural problems and its evidence is not trustworthy"
+        )
 
     if ny_local_evidence and fixed_evidence:
         raise IntegrityError(
@@ -247,23 +327,36 @@ def parse_histdata_csv(
             f"{expected_year:04d}-{expected_month:02d} (filename/content mismatch)"
         )
 
-    bid = raw["bid_s"].cast(pl.Float64, strict=False)
-    ask = raw["ask_s"].cast(pl.Float64, strict=False)
-    for name, col in (("bid", bid), ("ask", ask)):
+    col2 = raw["bid_s"].cast(pl.Float64, strict=False)
+    col3 = raw["ask_s"].cast(pl.Float64, strict=False)
+    for name, col in (("column 2 (price)", col2), ("column 3 (price)", col3)):
         null_mask = col.is_null()
         if null_mask.any():
             bad_idx = int(np.nonzero(null_mask.to_numpy())[0][0])
             raise IntegrityError(f"{path}: malformed {name} value at line {bad_idx + 1}")
 
-    bid_arr = bid.to_numpy()
-    ask_arr = ask.to_numpy()
+    col2_arr = col2.to_numpy()
+    col3_arr = col3.to_numpy()
+    column_order, column_order_evidence = detect_column_order(col2_arr, col3_arr)
+    if column_order == "bid_ask":
+        bid_arr, ask_arr = col2_arr, col3_arr
+    else:
+        bid_arr, ask_arr = col3_arr, col2_arr
+
+    # Sanity net, not the primary defence: detect_column_order already
+    # requires >=99% consistency, so this should fire only on a genuine
+    # anomaly within an otherwise-consistent file (never seen in real
+    # HistData exports at this point), not on a systematic column swap --
+    # that case is now caught earlier, with a clear diagnosis, by
+    # detect_column_order itself.
     bad_spread = np.nonzero(bid_arr >= ask_arr)[0]
     if len(bad_spread):
         bad_idx = int(bad_spread[0])
         raise IntegrityError(
-            f"{path}: bid >= ask at line {bad_idx + 1} (bid={bid_arr[bad_idx]}, "
-            f"ask={ask_arr[bad_idx]}) -- never seen in genuine HistData exports, "
-            "treated as corruption"
+            f"{path}: bid >= ask at line {bad_idx + 1} after column-order correction "
+            f"({column_order}) (bid={bid_arr[bad_idx]}, ask={ask_arr[bad_idx]}) -- "
+            "an isolated inversion within an otherwise-consistent file, treated as "
+            "corruption"
         )
 
     y_arr = year_i.to_numpy()
@@ -322,6 +415,8 @@ def parse_histdata_csv(
         month=expected_month,
         convention=convention,
         convention_evidence=evidence,
+        column_order=column_order,
+        column_order_evidence=column_order_evidence,
         ts_utc_ns=ts_utc_ns.astype(np.int64),
         bid=bid_arr,
         ask=ask_arr,
