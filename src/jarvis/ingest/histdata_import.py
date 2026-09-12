@@ -1,0 +1,452 @@
+"""HistData.com bulk import orchestration: source discovery (a zip of
+monthly zips, a directory of monthly zips, or a directory of already-
+extracted CSVs), tick Parquet writing with merge semantics (D-045), and
+per-month provenance logging.
+
+Writes into the tick Parquet layer at
+data/tick/instrument={instrument}/year={YYYY}/month={MM}/data.parquet,
+using the column names/dtypes jarvis.ingest.parse.parse_bi5_arrays'
+TickArrays already establishes (ts_utc_ns, bid, ask, bid_volume,
+ask_volume) so the schema is identical regardless of which ingest path
+produced it.
+
+NOTE ON DOWNSTREAM WIRING (flagged, not silently worked around): as of
+this package, jarvis.bars.resample_range reads raw .bi5 blobs directly
+via jarvis.ingest.urls.raw_blob_path / jarvis.ingest.parse.parse_bi5_arrays
+-- it does not read from data/tick/ at all. bars/resample.py is on this
+package's forbidden-file list, so this package cannot wire the two
+together; a follow-up change to bars/resample.py is required before
+resample_range will actually consume HistData-imported ticks. See this
+package's closing notes.
+"""
+
+import io
+import json
+import os
+import re
+import tempfile
+import zipfile
+from collections.abc import Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+import polars as pl
+
+from jarvis.core.errors import IntegrityError, UserError
+from jarvis.core.hashing import canonical_json
+from jarvis.core.types import Nanos
+
+from jarvis.ingest.histdata import HistDataMonth, TzConvention, parse_histdata_csv
+
+TICK_SCHEMA: dict[str, pl.DataType] = {
+    "ts_utc_ns": pl.Int64,
+    "bid": pl.Float64,
+    "ask": pl.Float64,
+    "bid_volume": pl.Float64,
+    "ask_volume": pl.Float64,
+}
+
+_WRITE_PARQUET_KWARGS = {
+    "compression": "zstd",
+    "compression_level": 3,
+    "statistics": True,
+    "row_group_size": 1_000_000,
+}
+
+_CSV_NAME_RE = re.compile(r"^DAT_ASCII_(?P<instrument>[A-Z]+)_T_(?P<year>\d{4})(?P<month>\d{2})\.csv$")
+_ZIP_NAME_RE = re.compile(
+    r"^HISTDATA_COM_ASCII_(?P<instrument>[A-Z]+)_T(?P<year>\d{4})(?P<month>\d{2})\.zip$"
+)
+_GAP_LINE_RE = re.compile(r"Gap of \d+s found between")
+
+
+@dataclass(frozen=True, slots=True)
+class ImportReport:
+    instrument: str
+    months_found: int
+    months_imported: int
+    months_skipped: tuple[str, ...]
+    total_ticks: int
+    conventions: Mapping[str, str]  # "2017-05" -> "ny_local"
+    gap_reports: Mapping[str, int]  # month -> gaps declared in the .txt
+    range_start_ns: Nanos
+    range_end_ns: Nanos
+    started_utc: str
+    completed_utc: str
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def tick_path(repo_root: Path, instrument: str, year: int, month: int) -> Path:
+    return (
+        repo_root
+        / "data"
+        / "tick"
+        / f"instrument={instrument}"
+        / f"year={year:04d}"
+        / f"month={month:02d}"
+        / "data.parquet"
+    )
+
+
+def import_log_path(repo_root: Path, instrument: str, year: int, month: int) -> Path:
+    return (
+        repo_root
+        / "data"
+        / "tick"
+        / f"instrument={instrument}"
+        / "_import_log"
+        / f"{year:04d}-{month:02d}.json"
+    )
+
+
+def _month_key(year: int, month: int) -> str:
+    return f"{year:04d}-{month:02d}"
+
+
+def write_ticks(repo_root: Path, instrument: str, year: int, month: int, frame: pl.DataFrame) -> Path:
+    """Write one month of ticks, atomically, MERGING with any existing
+    month file rather than replacing it (D-045 -- write_bars' own silent-
+    data-loss bug is exactly what this guards against): existing rows and
+    `frame`'s rows are concatenated, deduplicated on ts_utc_ns keeping
+    `frame`'s row for any collision (a re-import must win), sorted
+    ascending."""
+    path = tick_path(repo_root, instrument, year, month)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if path.is_file():
+        existing = pl.read_parquet(path)
+        combined = pl.concat([existing, frame])
+    else:
+        combined = frame
+
+    merged = combined.unique(subset=["ts_utc_ns"], keep="last", maintain_order=True).sort("ts_utc_ns")
+
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        merged.write_parquet(tmp_path, **_WRITE_PARQUET_KWARGS)
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise IntegrityError(f"failed to write tick parquet {path}: {exc}") from exc
+    return path
+
+
+def _histdata_month_to_frame(hist_month: HistDataMonth) -> pl.DataFrame:
+    n = hist_month.row_count
+    return pl.DataFrame(
+        {
+            "ts_utc_ns": hist_month.ts_utc_ns,
+            "bid": hist_month.bid,
+            "ask": hist_month.ask,
+            "bid_volume": [None] * n,
+            "ask_volume": [None] * n,
+        },
+        schema=TICK_SCHEMA,
+    )
+
+
+def write_import_log(
+    repo_root: Path,
+    instrument: str,
+    hist_month: HistDataMonth,
+    *,
+    declared_gaps: int,
+) -> Path:
+    path = import_log_path(repo_root, instrument, hist_month.year, hist_month.month)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "instrument": instrument,
+        "year": hist_month.year,
+        "month": hist_month.month,
+        "source_filename": hist_month.source_path.name,
+        "source_sha256": hist_month.source_sha256,
+        "convention": hist_month.convention,
+        "convention_evidence": hist_month.convention_evidence,
+        "row_count": hist_month.row_count,
+        "declared_gaps": declared_gaps,
+        "recorded_utc": _utc_now_iso(),
+    }
+    tmp_path = path.with_name(path.name + ".tmp")
+    try:
+        tmp_path.write_text(canonical_json(record), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise IntegrityError(f"failed to write import log {path}: {exc}") from exc
+    return path
+
+
+def read_import_log(repo_root: Path, instrument: str, year: int, month: int) -> dict | None:
+    path = import_log_path(repo_root, instrument, year, month)
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise IntegrityError(f"import log {path} is malformed: {exc}") from exc
+
+
+def parse_gap_report(text: str) -> int:
+    """Count HistData's own declared gaps from a .txt status report --
+    each is one line of the form 'Gap of {N}s found between {a} and {b}.'
+    There is no summary total line in HistData's own format; the count IS
+    the number of matching lines."""
+    return len(_GAP_LINE_RE.findall(text))
+
+
+# ---------------------------------------------------------------------------
+# Source discovery
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _MonthCandidate:
+    """A month discovered from filenames alone -- no extraction has
+    happened yet. Exactly one of csv_path / standalone_zip_path /
+    (outer_zip_path, outer_zip_member) is set. Kept deliberately cheap:
+    discovering all 196 months of a real source must not cost more than
+    reading directory/zip-index listings, so date-range and already-
+    imported filtering can happen BEFORE anything is extracted."""
+
+    instrument: str
+    year: int
+    month: int
+    csv_path: Path | None = None
+    standalone_zip_path: Path | None = None
+    outer_zip_path: Path | None = None
+    outer_zip_member: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _MonthSource:
+    instrument: str
+    year: int
+    month: int
+    csv_path: Path
+    gap_text: str | None
+
+
+def _candidates_from_directory(directory: Path, instrument_filter: str | None) -> list[_MonthCandidate]:
+    """A directory of already-extracted CSVs (with optional sibling .txt
+    files)."""
+    candidates = []
+    for csv_path in sorted(directory.glob("DAT_ASCII_*_T_*.csv")):
+        m = _CSV_NAME_RE.match(csv_path.name)
+        if not m:
+            continue
+        instrument = m.group("instrument")
+        if instrument_filter is not None and instrument != instrument_filter:
+            continue
+        candidates.append(
+            _MonthCandidate(
+                instrument=instrument,
+                year=int(m.group("year")),
+                month=int(m.group("month")),
+                csv_path=csv_path,
+            )
+        )
+    return candidates
+
+
+def _candidates_from_zip_directory(directory: Path, instrument_filter: str | None) -> list[_MonthCandidate]:
+    candidates = []
+    for zip_path in sorted(directory.glob("HISTDATA_COM_ASCII_*.zip")):
+        m = _ZIP_NAME_RE.match(zip_path.name)
+        if not m:
+            continue
+        instrument = m.group("instrument")
+        if instrument_filter is not None and instrument != instrument_filter:
+            continue
+        candidates.append(
+            _MonthCandidate(
+                instrument=instrument,
+                year=int(m.group("year")),
+                month=int(m.group("month")),
+                standalone_zip_path=zip_path,
+            )
+        )
+    return candidates
+
+
+def _candidates_from_outer_zip(outer_zip_path: Path, instrument_filter: str | None) -> list[_MonthCandidate]:
+    """Reads only the outer zip's directory listing (namelist()) -- does
+    not decompress any member."""
+    candidates = []
+    with zipfile.ZipFile(outer_zip_path) as outer:
+        for name in sorted(outer.namelist()):
+            m = _ZIP_NAME_RE.match(Path(name).name)
+            if not m:
+                continue
+            instrument = m.group("instrument")
+            if instrument_filter is not None and instrument != instrument_filter:
+                continue
+            candidates.append(
+                _MonthCandidate(
+                    instrument=instrument,
+                    year=int(m.group("year")),
+                    month=int(m.group("month")),
+                    outer_zip_path=outer_zip_path,
+                    outer_zip_member=name,
+                )
+            )
+    if not candidates:
+        raise UserError(f"{outer_zip_path}: no monthly HISTDATA_COM_ASCII_*.zip entries found inside")
+    return candidates
+
+
+def _discover_candidates(source: Path, instrument_filter: str | None) -> list[_MonthCandidate]:
+    """Detect one of: a single zip containing monthly zips, a directory
+    of monthly zips, or a directory of already-extracted CSVs."""
+    if source.is_file() and source.suffix.lower() == ".zip":
+        return _candidates_from_outer_zip(source, instrument_filter)
+    if source.is_dir():
+        zip_candidates = _candidates_from_zip_directory(source, instrument_filter)
+        if zip_candidates:
+            return zip_candidates
+        return _candidates_from_directory(source, instrument_filter)
+    raise UserError(f"{source}: not a zip file or directory")
+
+
+def _materialize(candidate: _MonthCandidate, work_dir: Path) -> _MonthSource:
+    """Extract (if needed) and return the CSV path + gap-report text for
+    one month. Only called for months that survive date-range/force/
+    already-imported filtering -- this is where the actual decompression
+    cost is paid, deliberately deferred until here."""
+    if candidate.csv_path is not None:
+        csv_path = candidate.csv_path
+        txt_path = csv_path.with_suffix(".txt")
+        gap_text = txt_path.read_text(encoding="utf-8", errors="replace") if txt_path.is_file() else None
+        return _MonthSource(candidate.instrument, candidate.year, candidate.month, csv_path, gap_text)
+
+    month_dir = work_dir / f"{candidate.year:04d}-{candidate.month:02d}"
+    month_dir.mkdir(parents=True, exist_ok=True)
+
+    if candidate.standalone_zip_path is not None:
+        source_desc = candidate.standalone_zip_path
+        with zipfile.ZipFile(candidate.standalone_zip_path) as zf:
+            zf.extractall(month_dir)
+    else:
+        if candidate.outer_zip_path is None or candidate.outer_zip_member is None:
+            raise IntegrityError(f"internal error: incomplete month candidate for {candidate.year:04d}-{candidate.month:02d}")
+        source_desc = candidate.outer_zip_path
+        with zipfile.ZipFile(candidate.outer_zip_path) as outer, outer.open(candidate.outer_zip_member) as member:
+            inner_bytes = member.read()
+        with zipfile.ZipFile(io.BytesIO(inner_bytes)) as inner:
+            inner.extractall(month_dir)
+
+    csv_path = month_dir / f"DAT_ASCII_{candidate.instrument}_T_{candidate.year:04d}{candidate.month:02d}.csv"
+    txt_path = month_dir / f"DAT_ASCII_{candidate.instrument}_T_{candidate.year:04d}{candidate.month:02d}.txt"
+    if not csv_path.is_file():
+        raise IntegrityError(f"{source_desc}: expected {csv_path.name} not found after extraction")
+    gap_text = txt_path.read_text(encoding="utf-8", errors="replace") if txt_path.is_file() else None
+    return _MonthSource(candidate.instrument, candidate.year, candidate.month, csv_path, gap_text)
+
+
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
+def import_histdata(
+    repo_root: Path,
+    source_dir: Path,
+    instrument: str,
+    *,
+    start: tuple[int, int] | None = None,
+    end: tuple[int, int] | None = None,
+    force: bool = False,
+) -> ImportReport:
+    """Import every HistData monthly CSV found under `source_dir` for
+    `instrument` into the tick Parquet layer, month by month.
+
+    `start`/`end` are inclusive (year, month) bounds; a month outside
+    them is skipped. `force` re-imports a month even if
+    data/tick/.../data.parquet already exists for it (merge semantics
+    still apply -- this is about whether to redo the work, not about
+    overwrite safety, which write_ticks always provides)."""
+    started_utc = _utc_now_iso()
+
+    with tempfile.TemporaryDirectory(prefix="histdata_import_") as tmp:
+        work_dir = Path(tmp)
+        candidates = _discover_candidates(source_dir, instrument)
+        candidates.sort(key=lambda c: (c.year, c.month))
+
+        months_found = len(candidates)
+        months_imported = 0
+        months_skipped: list[str] = []
+        total_ticks = 0
+        conventions: dict[str, str] = {}
+        gap_reports: dict[str, int] = {}
+        range_start_ns: int | None = None
+        range_end_ns: int | None = None
+
+        # December/January/February files have no EDT Fridays at all, so
+        # detect_tz_convention has NOTHING to discriminate on for them --
+        # this is a real, fundamental limit of per-file detection (both
+        # conventions read identically during EST), not a bug. Processing
+        # months in chronological order and carrying the most recently
+        # VERIFIED convention forward as a hint lets a winter month fall
+        # back to real evidence from a nearby month in the SAME run,
+        # rather than hard-failing on most Decembers/Januaries/Februaries
+        # in a full historical import. A hint is only ever used when a
+        # file's own content provides no evidence -- real per-file
+        # evidence always wins when it exists (detect_tz_convention's own
+        # rule), so this never overrides what a file actually says.
+        last_verified_convention: TzConvention | None = None
+
+        for candidate in candidates:
+            key = _month_key(candidate.year, candidate.month)
+            if start is not None and (candidate.year, candidate.month) < start:
+                months_skipped.append(key)
+                continue
+            if end is not None and (candidate.year, candidate.month) > end:
+                months_skipped.append(key)
+                continue
+
+            existing_path = tick_path(repo_root, instrument, candidate.year, candidate.month)
+            if existing_path.is_file() and not force:
+                months_skipped.append(key)
+                continue
+
+            # Extraction (if any) happens here, deferred until this month
+            # has survived every cheap filter above.
+            src = _materialize(candidate, work_dir)
+            hist_month = parse_histdata_csv(
+                src.csv_path, instrument, src.year, src.month, convention_hint=last_verified_convention
+            )
+            last_verified_convention = hist_month.convention
+            frame = _histdata_month_to_frame(hist_month)
+            write_ticks(repo_root, instrument, src.year, src.month, frame)
+
+            declared_gaps = parse_gap_report(src.gap_text) if src.gap_text is not None else 0
+            write_import_log(repo_root, instrument, hist_month, declared_gaps=declared_gaps)
+
+            months_imported += 1
+            total_ticks += hist_month.row_count
+            conventions[key] = hist_month.convention
+            gap_reports[key] = declared_gaps
+
+            month_start_ns = int(hist_month.ts_utc_ns[0])
+            month_end_ns = int(hist_month.ts_utc_ns[-1]) + 1
+            range_start_ns = month_start_ns if range_start_ns is None else min(range_start_ns, month_start_ns)
+            range_end_ns = month_end_ns if range_end_ns is None else max(range_end_ns, month_end_ns)
+
+    completed_utc = _utc_now_iso()
+
+    return ImportReport(
+        instrument=instrument,
+        months_found=months_found,
+        months_imported=months_imported,
+        months_skipped=tuple(months_skipped),
+        total_ticks=total_ticks,
+        conventions=conventions,
+        gap_reports=gap_reports,
+        range_start_ns=Nanos(range_start_ns if range_start_ns is not None else 0),
+        range_end_ns=Nanos(range_end_ns if range_end_ns is not None else 0),
+        started_utc=started_utc,
+        completed_utc=completed_utc,
+    )

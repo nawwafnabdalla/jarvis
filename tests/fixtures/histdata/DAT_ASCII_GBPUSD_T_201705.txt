@@ -1,0 +1,8 @@
+HistData.com (c) 2012
+File: DAT_ASCII_GBPUSD_T_201705.csv Status Report
+
+Gap of 61s found between 20170501000001 and 20170501000002.
+Gap of 3600s found between 20170505083000 and 20170505165900.
+
+Average tick interval: 1000 miliseconds.
+Maximum tick interval found: 3600000 miliseconds.

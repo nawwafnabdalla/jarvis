@@ -6,6 +6,7 @@ import shutil
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import polars as pl
 import typer
@@ -18,6 +19,7 @@ from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.features import REGISTRY, compute, write_features
 from jarvis.ingest.fetch import ingest_range
+from jarvis.ingest.histdata_import import import_histdata
 from jarvis.ingest.urls import NS_PER_HOUR
 from jarvis.probe.report import (
     VAULT_BOUNDARY_NS,
@@ -302,6 +304,75 @@ def data_validate(
 
     if report.errors > 0:
         raise typer.Exit(code=3)
+
+
+def _parse_yearmonth(value: str, *, option_name: str) -> tuple[int, int]:
+    try:
+        year_s, month_s = value.split("-")
+        year, month = int(year_s), int(month_s)
+    except ValueError as exc:
+        raise UserError(f"{option_name}: not a valid YYYY-MM value: {value!r}") from exc
+    if not (1 <= month <= 12):
+        raise UserError(f"{option_name}: month out of range in {value!r}")
+    return year, month
+
+
+@data_app.command("import-histdata")
+def data_import_histdata(
+    source: str = typer.Option(
+        ..., "--source", help="A zip of monthly zips, a directory of monthly zips, or a directory of CSVs"
+    ),
+    from_: str = typer.Option(None, "--from", help="YYYY-MM, inclusive"),
+    to: str = typer.Option(None, "--to", help="YYYY-MM, inclusive"),
+    force: bool = typer.Option(False, "--force", help="Re-import months even if already present"),
+) -> None:
+    """Import HistData.com monthly tick CSVs into the tick Parquet layer.
+
+    Per-file timezone convention (ny_local vs fixed_utc_minus_5) is
+    detected independently for every month -- never assumed constant.
+    Prints a summary of conventions at the end; if the imported range is
+    not uniformly one convention, that is called out explicitly rather
+    than left for the reader to notice in a table."""
+    try:
+        source_path = Path(source)
+        start = _parse_yearmonth(from_, option_name="--from") if from_ else None
+        end = _parse_yearmonth(to, option_name="--to") if to else None
+        root = repo_root()
+
+        typer.echo(f"Importing HistData  {_INSTRUMENT}  source={source_path}  from={from_}  to={to}")
+
+        started = time.perf_counter()
+        report = import_histdata(root, source_path, _INSTRUMENT, start=start, end=end, force=force)
+        elapsed = time.perf_counter() - started
+    except JarvisError as exc:
+        typer.echo(f"jarvis data import-histdata: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc
+
+    typer.echo()
+    for key in sorted(report.conventions):
+        typer.echo(
+            f"  {key}  convention={report.conventions[key]:<18} "
+            f"declared_gaps={report.gap_reports.get(key, 0)}"
+        )
+    typer.echo()
+    typer.echo(f"  Months found       {report.months_found}")
+    typer.echo(f"  Months imported    {report.months_imported}")
+    typer.echo(f"  Months skipped     {len(report.months_skipped)}")
+    typer.echo(f"  Total ticks        {report.total_ticks:,}")
+
+    distinct_conventions = set(report.conventions.values())
+    if len(distinct_conventions) > 1:
+        typer.echo(
+            f"  WARNING: imported range uses MORE THAN ONE timezone convention: "
+            f"{sorted(distinct_conventions)} -- see per-month breakdown above"
+        )
+    elif distinct_conventions:
+        typer.echo(f"  Convention (uniform) {next(iter(distinct_conventions))}")
+
+    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
+    if report.months_imported > 0:
+        per_month = elapsed / report.months_imported
+        typer.echo(f"  Throughput         {per_month:.2f}s/month")
 
 
 @features_app.command("build")
