@@ -328,11 +328,14 @@ def data_import_histdata(
 ) -> None:
     """Import HistData.com monthly tick CSVs into the tick Parquet layer.
 
-    Per-file timezone convention (ny_local vs fixed_utc_minus_5) is
-    detected independently for every month -- never assumed constant.
-    Prints a summary of conventions at the end; if the imported range is
-    not uniformly one convention, that is called out explicitly rather
-    than left for the reader to notice in a table."""
+    Per-file stamp clock (us_dst vs eu_dst, D-055) and column order
+    (bid_ask vs ask_bid vs mixed_per_day, D-055h/D-056) are each detected
+    independently for every month, from that file's own content only --
+    never carried from a neighbour. A mix of us_dst and eu_dst months in
+    one import is the EXPECTED, correct outcome for any range spanning
+    2018/2019 (D-055: HistData's stamps changed which DST calendar they
+    follow around that boundary) -- not a fault to warn about. Prints a
+    per-month breakdown plus a summary tally of each."""
     try:
         source_path = Path(source)
         start = _parse_yearmonth(from_, option_name="--from") if from_ else None
@@ -349,9 +352,9 @@ def data_import_histdata(
         raise typer.Exit(code=exc.exit_code) from exc
 
     typer.echo()
-    for key in sorted(report.conventions):
+    for key in sorted(report.stamp_clocks):
         typer.echo(
-            f"  {key}  convention={report.conventions[key]:<18} "
+            f"  {key}  stamp_clock={report.stamp_clocks[key]:<14} "
             f"declared_gaps={report.gap_reports.get(key, 0)}"
         )
     typer.echo()
@@ -360,14 +363,10 @@ def data_import_histdata(
     typer.echo(f"  Months skipped     {len(report.months_skipped)}")
     typer.echo(f"  Total ticks        {report.total_ticks:,}")
 
-    distinct_conventions = set(report.conventions.values())
-    if len(distinct_conventions) > 1:
-        typer.echo(
-            f"  WARNING: imported range uses MORE THAN ONE timezone convention: "
-            f"{sorted(distinct_conventions)} -- see per-month breakdown above"
-        )
-    elif distinct_conventions:
-        typer.echo(f"  Convention (uniform) {next(iter(distinct_conventions))}")
+    clock_tally: dict[str, int] = {}
+    for clock in report.stamp_clocks.values():
+        clock_tally[clock] = clock_tally.get(clock, 0) + 1
+    typer.echo(f"  Stamp clock tally  {dict(sorted(clock_tally.items()))}")
 
     typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
     if report.months_imported > 0:

@@ -108,6 +108,8 @@ def test_import_log_records_stamp_clock_evidence_sha256(tmp_path: Path):
     assert log["stamp_clock"] is None
     assert log["stamp_clock_determination"] == "not_required_both_clocks_agree"
     assert "no date on which the US and EU DST calendars disagree" in log["stamp_clock_evidence"]
+    assert log["column_order"] == "bid_ask"
+    assert log["column_order_determination"] == "detected_whole_file"
     assert log["source_sha256"] == _sha256_of_file(source / "DAT_ASCII_GBPUSD_T_201705.csv")
     assert log["row_count"] == 5
     assert log["source_filename"] == "DAT_ASCII_GBPUSD_T_201705.csv"
@@ -141,6 +143,42 @@ def test_import_log_records_a_detected_stamp_clock(tmp_path: Path):
     assert log["stamp_clock_determination"] == "detected_from_file_content"
     assert "2022-03-18" in log["stamp_clock_evidence"]
     assert "spring clock switch verified" in log["stamp_clock_evidence"]
+    assert log["column_order"] == "bid_ask"
+    assert log["column_order_determination"] == "detected_whole_file"
+
+
+def test_import_log_records_mixed_per_day_column_order(tmp_path: Path):
+    """A file that switches column order mid-month at a weekend boundary
+    (2009-05's shape, D-055h / D-056) must be imported, not refused, and
+    the log must say explicitly that the per-day fallback was needed --
+    not just report a value that happens to differ."""
+    repo_root = tmp_path / "repo"
+    source = tmp_path / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "DAT_ASCII_GBPUSD_T_201705.csv").write_text(
+        "\n".join(
+            [
+                "20170515 120000000,1.29020,1.29010,0",  # ask_bid segment
+                "20170517 120000000,1.29030,1.29020,0",
+                "20170519 165900000,1.29040,1.29030,0",  # Friday close
+                "20170521 170100000,1.29000,1.29010,0",  # Sunday reopen -- switch
+                "20170522 120000000,1.29010,1.29020,0",  # bid_ask segment
+                "20170524 120000000,1.29020,1.29030,0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (source / "DAT_ASCII_GBPUSD_T_201705.txt").write_text("", encoding="utf-8")
+
+    import_histdata(repo_root, source, "GBPUSD", start=(2017, 5), end=(2017, 5))
+
+    log = read_import_log(repo_root, "GBPUSD", 2017, 5)
+    assert log["column_order"] == "mixed_per_day"
+    assert log["column_order_determination"] == "detected_per_day_at_weekend_boundary"
+    assert "2017-05-19" in log["column_order_evidence"]
+    assert "2017-05-21" in log["column_order_evidence"]
+    assert log["row_count"] == 6
 
 
 def test_gap_count_parsed_from_txt(tmp_path: Path):

@@ -100,7 +100,7 @@ _UTC_MINUS_5 = -5 * NS_PER_HOUR
 _UTC_MINUS_4 = -4 * NS_PER_HOUR
 
 StampClock = Literal["us_dst", "eu_dst"]
-ColumnOrder = Literal["bid_ask", "ask_bid"]
+ColumnOrder = Literal["bid_ask", "ask_bid", "mixed_per_day"]
 
 _TS_RE = re.compile(r"^\d{8} \d{9}$")
 
@@ -108,16 +108,20 @@ _TS_RE = re.compile(r"^\d{8} \d{9}$")
 # 2009-04 have their price columns as (ask, bid), not the documented
 # (bid, ask) -- confirmed 100% inverted (col2 > col3) across every row of
 # every one of those months, and the documented order from 2009-06
-# onward. 2009-05 is the changeover month and is NOT clean: it switches
-# mid-month, at a weekend boundary -- May 1-22 are 100% (ask, bid) and
-# May 24-31 are 0%, so the file-level fraction is 0.7618 and the check
-# below correctly refuses it. See docs/WP-009-TZ-FINDING.md section 5.2;
-# reading column order per day would import it, and that is an open
-# decision, not something to guess. A spread is positive by
-# definition (ask > bid) on essentially every tick, so the fraction of
-# rows with col2 > col3 is decisive; 1% tolerance absorbs genuine
-# zero-spread thin quotes (observed: 5 rows out of 554,877 in a clean
-# 2009-11 file) without letting a genuinely mixed file through.
+# onward. 2009-05 is the changeover month and is NOT clean at the
+# whole-file level: it switches mid-month, at the May 22/24 weekend
+# boundary -- May 1-22 are 100% (ask, bid) and May 24-31 are 0% (bid,
+# ask), so the file-level fraction is 0.7618, matching neither threshold.
+# D-055h decided (and D-056 implements) that this is resolved per day,
+# not refused: detect_column_order still runs at the whole-file level
+# first and is unchanged; only when it finds the file inconsistent does
+# _detect_column_order_per_day retry per calendar day under the SAME
+# thresholds, accepting a single switch only when it lands exactly on a
+# weekend boundary. A spread is positive by definition (ask > bid) on
+# essentially every tick, so the fraction of rows with col2 > col3 is
+# decisive; 1% tolerance absorbs genuine zero-spread thin quotes
+# (observed: 5 rows out of 554,877 in a clean 2009-11 file) without
+# letting a genuinely mixed file through.
 _COLUMN_ORDER_HIGH_THRESHOLD = 0.99
 _COLUMN_ORDER_LOW_THRESHOLD = 0.01
 
@@ -132,6 +136,11 @@ class HistDataMonth:
     # stamp in it, so no determination was needed.
     stamp_clock: StampClock | None
     stamp_clock_evidence: str  # human-readable, goes in the import report
+    # "mixed_per_day" (D-055h / D-056) means the file switches column order
+    # exactly once, at a verified weekend boundary -- bid/ask are still
+    # resolved correctly for every row; there is no ambiguity left by the
+    # time this value is set. It is never a fallback the caller must guard
+    # against, only a record of which detection path resolved the file.
     column_order: ColumnOrder
     column_order_evidence: str  # human-readable, goes in the import report
     ts_utc_ns: np.ndarray  # int64, ascending
@@ -182,6 +191,129 @@ def detect_column_order(col2: np.ndarray, col3: np.ndarray) -> tuple[ColumnOrder
         "imported safely under either (bid, ask) or (ask, bid); requires a human "
         "decision, not an automatic guess"
     )
+
+
+# D-055h / D-056: how far apart two calendar days may be and still count as
+# "immediately across a weekend" -- Friday to Sunday is 2 days, Friday to
+# Monday (if Sunday's file happens to have zero ticks) is 3. Anything wider
+# is not a weekend gap, whatever the weekdays involved.
+_MAX_WEEKEND_SPAN_DAYS = 3
+
+
+def _is_weekend_boundary(prev_date: date, next_date: date) -> bool:
+    """True when `next_date` is the first day WITH DATA after `prev_date`
+    and the gap between them is exactly a normal weekend closure: the
+    market's last trading day is a Friday, and it reopens no earlier than
+    Saturday and no later than Monday. Both conditions matter -- a
+    Friday-to-following-Friday gap (no weekend in between, a whole missing
+    week) has the right start weekday but the wrong span, and a
+    Tuesday-to-Wednesday gap has the right span but is not a weekend at
+    all."""
+    return (
+        prev_date.weekday() == _FRIDAY
+        and next_date.weekday() in (5, 6, 0)  # Sat, Sun, or Mon
+        and 0 < (next_date - prev_date).days <= _MAX_WEEKEND_SPAN_DAYS
+    )
+
+
+def _detect_column_order_per_day(
+    col2: np.ndarray,
+    col3: np.ndarray,
+    day_arr: np.ndarray,
+    year: int,
+    month: int,
+) -> tuple[np.ndarray, str]:
+    """Resolve column order per calendar day, for a file detect_column_order
+    has already found inconsistent at the whole-file level (D-055h /
+    2009-05: the file switches column order mid-month at a weekend
+    boundary, rather than being genuinely ambiguous).
+
+    Classifies each day independently under the SAME >=99%/<=1% rule
+    detect_column_order uses for a whole file. A single switch between
+    consecutive (data-bearing) days is accepted ONLY when it falls exactly
+    on a weekend boundary -- the file correctly changing convention
+    between one trading week and the next, not damage. Everything else is
+    treated as genuine ambiguity and raises IntegrityError, naming the day
+    and fraction, exactly as detect_column_order does for a whole file:
+      - a single day whose OWN rows are internally inconsistent
+      - more than one switch across the month
+      - a switch that does not land on a weekend boundary
+
+    Returns (order_is_ask_bid, evidence): a boolean array aligned to every
+    row (True where that row's columns are (ask, bid)), plus a one-line
+    evidence string naming the switch and both segments' fractions."""
+    unique_days = np.unique(day_arr)
+    day_order: dict[int, ColumnOrder] = {}
+    day_frac: dict[int, float] = {}
+
+    for d in unique_days:
+        mask = day_arr == d
+        c2, c3 = col2[mask], col3[mask]
+        frac = float(np.count_nonzero(c2 > c3)) / len(c2)
+        day_frac[int(d)] = frac
+        if frac <= _COLUMN_ORDER_LOW_THRESHOLD:
+            day_order[int(d)] = "bid_ask"
+        elif frac >= _COLUMN_ORDER_HIGH_THRESHOLD:
+            day_order[int(d)] = "ask_bid"
+        else:
+            raise IntegrityError(
+                f"{year:04d}-{month:02d}-{int(d):02d}: internally inconsistent column "
+                f"order WITHIN this single day -- {frac:.4f} of {len(c2)} rows have "
+                "col2 > col3 (neither >= 0.99 nor <= 0.01). This is not a mid-month "
+                "switch between clean days; it is ambiguity inside one day, and cannot "
+                "be resolved automatically"
+            )
+
+    ordered_days = sorted(day_order)
+    switches = [
+        (prev_d, next_d)
+        for prev_d, next_d in zip(ordered_days, ordered_days[1:])
+        if day_order[prev_d] != day_order[next_d]
+    ]
+
+    if not switches:
+        # Should not happen: detect_column_order already found the whole
+        # file inconsistent (neither >=99% nor <=1%), which requires at
+        # least two differently-classified days to produce.
+        raise IntegrityError(
+            f"{year:04d}-{month:02d}: file-level column order is inconsistent but no "
+            "per-day switch could be located -- this should not happen and needs "
+            "investigation, not a guess"
+        )
+    if len(switches) > 1:
+        detail = "; ".join(
+            f"{date(year, month, a)} ({day_order[a]}) -> {date(year, month, b)} ({day_order[b]})"
+            for a, b in switches
+        )
+        raise IntegrityError(
+            f"{year:04d}-{month:02d}: column order switches {len(switches)} times, not "
+            f"once -- {detail}. This is not the clean single mid-month transition this "
+            "code handles; requires a human decision, not an automatic guess"
+        )
+
+    prev_d, next_d = switches[0]
+    prev_date, next_date = date(year, month, prev_d), date(year, month, next_d)
+    if not _is_weekend_boundary(prev_date, next_date):
+        raise IntegrityError(
+            f"{year:04d}-{month:02d}: column order switches from {day_order[prev_d]} "
+            f"(frac={day_frac[prev_d]:.4f}) to {day_order[next_d]} "
+            f"(frac={day_frac[next_d]:.4f}) between {prev_date} "
+            f"({prev_date.strftime('%A')}) and {next_date} ({next_date.strftime('%A')}) "
+            "-- this is NOT a weekend boundary, so it cannot be a clean mid-month "
+            "transition; it is genuine ambiguity and requires a human decision, not an "
+            "automatic guess"
+        )
+
+    order_is_ask_bid = np.zeros(len(col2), dtype=bool)
+    for d, order in day_order.items():
+        order_is_ask_bid[day_arr == d] = order == "ask_bid"
+
+    evidence = (
+        f"column order switches mid-month at a weekend boundary: {prev_date} "
+        f"({day_order[prev_d]}, frac={day_frac[prev_d]:.4f}) -> {next_date} "
+        f"({day_order[next_d]}, frac={day_frac[next_d]:.4f})"
+    )
+    return order_is_ask_bid, evidence
 
 
 def _naive_ns(y: int, mo: int, d: int, h: int = 0, mi: int = 0, s: int = 0, ms: int = 0) -> int:
@@ -578,11 +710,24 @@ def parse_histdata_csv(
 
     col2_arr = col2.to_numpy()
     col3_arr = col3.to_numpy()
-    column_order, column_order_evidence = detect_column_order(col2_arr, col3_arr)
-    if column_order == "bid_ask":
-        bid_arr, ask_arr = col2_arr, col3_arr
-    else:
-        bid_arr, ask_arr = col3_arr, col2_arr
+    d_arr = day_i.to_numpy()
+
+    try:
+        column_order, column_order_evidence = detect_column_order(col2_arr, col3_arr)
+        order_is_ask_bid = np.full(n, column_order == "ask_bid", dtype=bool)
+    except IntegrityError:
+        # The whole-file check is not decisive either way. Before treating
+        # that as corruption, check whether this is a clean per-day switch
+        # at a weekend boundary (D-055h / 2009-05's shape) rather than
+        # genuine ambiguity -- _detect_column_order_per_day raises its own
+        # IntegrityError, with a diagnosis naming the day, if it is not.
+        order_is_ask_bid, column_order_evidence = _detect_column_order_per_day(
+            col2_arr, col3_arr, d_arr, expected_year, expected_month
+        )
+        column_order = "mixed_per_day"
+
+    bid_arr = np.where(order_is_ask_bid, col3_arr, col2_arr)
+    ask_arr = np.where(order_is_ask_bid, col2_arr, col3_arr)
 
     # Sanity net, not the primary defence: detect_column_order already
     # requires >=99% consistency, so this should fire only on a genuine
@@ -610,7 +755,6 @@ def parse_histdata_csv(
 
     y_arr = year_i.to_numpy()
     mo_arr = month_i.to_numpy()
-    d_arr = day_i.to_numpy()
     h_arr = hour_i.to_numpy()
     mi_arr = minute_i.to_numpy()
     s_arr = second_i.to_numpy()

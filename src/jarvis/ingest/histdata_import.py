@@ -157,14 +157,22 @@ def write_import_log(
     declared_gaps: int,
 ) -> Path:
     """Records which daylight-saving calendar this month's stamps were
-    read as following, and why.
+    read as following, and how its column order was resolved, and why.
 
     `stamp_clock` is `"us_dst"`, `"eu_dst"`, or null. Null is a normal
     outcome, not a gap in the record: it means the file has no ticks on
     any date where the US and EU calendars disagree, so both clocks assign
     the same UTC instant to every stamp in it and no determination was
     needed. `stamp_clock_determination` says which of those happened, so
-    a reader never has to infer it from a null."""
+    a reader never has to infer it from a null.
+
+    `column_order` is `"bid_ask"`, `"ask_bid"`, or `"mixed_per_day"` (the
+    file switches order once, cleanly, at a weekend boundary -- D-055h /
+    2009-05's shape; every column-order value now traces to this file's
+    own content, since the convention-carrying hint D-055c removed never
+    applied to column order in the first place). `column_order_determination`
+    says whether the whole-file >=99%/<=1% check alone was decisive, or
+    whether the per-day fallback was needed to resolve it."""
     path = import_log_path(repo_root, instrument, hist_month.year, hist_month.month)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -182,6 +190,11 @@ def write_import_log(
         ),
         "column_order": hist_month.column_order,
         "column_order_evidence": hist_month.column_order_evidence,
+        "column_order_determination": (
+            "detected_per_day_at_weekend_boundary"
+            if hist_month.column_order == "mixed_per_day"
+            else "detected_whole_file"
+        ),
         "row_count": hist_month.row_count,
         "declared_gaps": declared_gaps,
         "recorded_utc": _utc_now_iso(),

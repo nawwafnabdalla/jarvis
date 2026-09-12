@@ -225,3 +225,65 @@ def test_zero_spread_rows_tolerated():
     col3[:equal_rows] = col2[:equal_rows]  # zero spread on these rows
     order, evidence = detect_column_order(col2, col3)
     assert order == "bid_ask"
+
+
+# per-day column order (D-055h / D-056: the 2009-05 shape) ------------------
+
+
+def test_column_order_switches_mid_file_at_weekend_boundary(tmp_path):
+    """Reproduces 2009-05's shape: the whole-file fraction is ambiguous
+    (neither >=99% nor <=1%) because the file cleanly switches column
+    order once, exactly at a weekend boundary. This must import
+    correctly -- column_order reported as "mixed_per_day", and every
+    row's bid/ask reconstructed under its OWN day's order, not one
+    file-wide guess. 2017-05-19 is a Friday, 2017-05-21 the following
+    Sunday; May 2017 has no divergent DST dates, so stamp_clock stays
+    uncoupled from this test."""
+    csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
+    _write_csv(
+        csv_path,
+        [
+            _row("20170515 120000000", 1.29020, 1.29010),  # ask_bid segment
+            _row("20170517 120000000", 1.29030, 1.29020),
+            _row("20170519 165900000", 1.29040, 1.29030),  # last: Friday close
+            _row("20170521 170100000", 1.29000, 1.29010),  # first: Sunday reopen -- switch
+            _row("20170522 120000000", 1.29010, 1.29020),  # bid_ask segment
+            _row("20170524 120000000", 1.29020, 1.29030),
+        ],
+    )
+    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
+    assert result.column_order == "mixed_per_day"
+    assert "2017-05-19" in result.column_order_evidence
+    assert "2017-05-21" in result.column_order_evidence
+    assert result.row_count == 6
+    # first row: ask_bid segment -- col2=1.29020 is ask, col3=1.29010 is bid
+    assert result.bid[0] == pytest.approx(1.29010)
+    assert result.ask[0] == pytest.approx(1.29020)
+    # last row: bid_ask segment -- col2=1.29020 is bid, col3=1.29030 is ask
+    assert result.bid[-1] == pytest.approx(1.29020)
+    assert result.ask[-1] == pytest.approx(1.29030)
+    assert np.all(result.bid < result.ask)
+
+
+def test_column_order_switch_off_weekend_boundary_raises(tmp_path):
+    """A column-order switch that does NOT fall on a weekend boundary is
+    genuine ambiguity, not a clean mid-month transition, and must still
+    raise IntegrityError naming the day and fraction -- never a silent
+    guess. 2017-05-16 (Tue) -> 2017-05-17 (Wed) is a plain midweek
+    boundary with no weekend in between."""
+    csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
+    _write_csv(
+        csv_path,
+        [
+            _row("20170515 120000000", 1.29020, 1.29010),  # ask_bid
+            _row("20170516 120000000", 1.29030, 1.29020),  # ask_bid
+            _row("20170517 120000000", 1.29000, 1.29010),  # bid_ask -- switch, midweek
+            _row("20170518 120000000", 1.29010, 1.29020),  # bid_ask
+        ],
+    )
+    with pytest.raises(IntegrityError) as excinfo:
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
+    msg = str(excinfo.value)
+    assert "2017-05-16" in msg
+    assert "2017-05-17" in msg
+    assert "NOT a weekend boundary" in msg
