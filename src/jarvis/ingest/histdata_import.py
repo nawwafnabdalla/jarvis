@@ -37,7 +37,7 @@ from jarvis.core.errors import IntegrityError, UserError
 from jarvis.core.hashing import canonical_json
 from jarvis.core.types import Nanos
 
-from jarvis.ingest.histdata import HistDataMonth, TzConvention, parse_histdata_csv
+from jarvis.ingest.histdata import HistDataMonth, parse_histdata_csv
 
 TICK_SCHEMA: dict[str, pl.DataType] = {
     "ts_utc_ns": pl.Int64,
@@ -68,7 +68,7 @@ class ImportReport:
     months_imported: int
     months_skipped: tuple[str, ...]
     total_ticks: int
-    conventions: Mapping[str, str]  # "2017-05" -> "ny_local"
+    stamp_clocks: Mapping[str, str]  # "2017-05" -> "us_dst" | "not_required"
     gap_reports: Mapping[str, int]  # month -> gaps declared in the .txt
     range_start_ns: Nanos
     range_end_ns: Nanos
@@ -155,15 +155,16 @@ def write_import_log(
     hist_month: HistDataMonth,
     *,
     declared_gaps: int,
-    convention_source: str,
 ) -> Path:
-    """`convention_source` is `"detected"` when this month's own content
-    provided discriminating evidence, or `"carried_from_{YYYY-MM}"` when
-    it had none and inherited the convention from another month in the
-    same import run (WP-009-CORRECTION: a month whose convention was
-    assumed rather than proven must be visibly distinguishable from one
-    that was verified, since a carried hint is exactly what would mask a
-    changeover landing mid-winter)."""
+    """Records which daylight-saving calendar this month's stamps were
+    read as following, and why.
+
+    `stamp_clock` is `"us_dst"`, `"eu_dst"`, or null. Null is a normal
+    outcome, not a gap in the record: it means the file has no ticks on
+    any date where the US and EU calendars disagree, so both clocks assign
+    the same UTC instant to every stamp in it and no determination was
+    needed. `stamp_clock_determination` says which of those happened, so
+    a reader never has to infer it from a null."""
     path = import_log_path(repo_root, instrument, hist_month.year, hist_month.month)
     path.parent.mkdir(parents=True, exist_ok=True)
     record = {
@@ -172,9 +173,13 @@ def write_import_log(
         "month": hist_month.month,
         "source_filename": hist_month.source_path.name,
         "source_sha256": hist_month.source_sha256,
-        "convention": hist_month.convention,
-        "convention_evidence": hist_month.convention_evidence,
-        "convention_source": convention_source,
+        "stamp_clock": hist_month.stamp_clock,
+        "stamp_clock_evidence": hist_month.stamp_clock_evidence,
+        "stamp_clock_determination": (
+            "detected_from_file_content"
+            if hist_month.stamp_clock is not None
+            else "not_required_both_clocks_agree"
+        ),
         "column_order": hist_month.column_order,
         "column_order_evidence": hist_month.column_order_evidence,
         "row_count": hist_month.row_count,
@@ -390,30 +395,25 @@ def import_histdata(
         months_imported = 0
         months_skipped: list[str] = []
         total_ticks = 0
-        conventions: dict[str, str] = {}
+        stamp_clocks: dict[str, str] = {}
         gap_reports: dict[str, int] = {}
         range_start_ns: int | None = None
         range_end_ns: int | None = None
 
-        # December/January/February files have no EDT Fridays at all, so
-        # detect_tz_convention has NOTHING to discriminate on for them --
-        # this is a real, fundamental limit of per-file detection (both
-        # conventions read identically during EST), not a bug. Processing
-        # months in chronological order and carrying the most recently
-        # VERIFIED convention forward as a hint lets a winter month fall
-        # back to real evidence from a nearby month in the SAME run,
-        # rather than hard-failing on most Decembers/Januaries/Februaries
-        # in a full historical import. A hint is only ever used when a
-        # file's own content provides no evidence -- real per-file
-        # evidence always wins when it exists (detect_tz_convention's own
-        # rule), so this never overrides what a file actually says.
-        last_verified_convention: TzConvention | None = None
-        # The month key that ACTUALLY detected last_verified_convention
-        # from real evidence -- kept separate from last_verified_convention
-        # itself so a chain of hint-only months all point back to the one
-        # month that was genuinely verified, rather than diluting into
-        # "carried from a month that was itself only carried."
-        last_verified_source_key: str | None = None
+        # NOTE: no convention is ever carried between months. An earlier
+        # version of this loop threaded the most recently verified
+        # convention forward as a hint, because detection was blind on
+        # months with no EDT Friday (most Decembers, Januaries and
+        # Februaries) and would otherwise hard-fail on them. That crutch
+        # is gone, and deliberately so: those months are blind precisely
+        # because BOTH clocks convert them identically, so there is
+        # nothing there to be wrong about and nothing to inherit. Only
+        # March, October and November files contain a date where the two
+        # calendars disagree, and every one of those carries its own
+        # weekend-boundary evidence. Carrying a convention across the
+        # 2018/2019 changeover is exactly how that changeover stayed
+        # hidden, so a month now either proves its own clock or does not
+        # need one.
 
         for candidate in candidates:
             key = _month_key(candidate.year, candidate.month)
@@ -432,27 +432,7 @@ def import_histdata(
             # Extraction (if any) happens here, deferred until this month
             # has survived every cheap filter above.
             src = _materialize(candidate, work_dir)
-            hist_month = parse_histdata_csv(
-                src.csv_path, instrument, src.year, src.month, convention_hint=last_verified_convention
-            )
-            # detect_tz_convention tags its own hint-fallback branch with
-            # this exact substring -- checking for it (rather than e.g.
-            # comparing to last_verified_convention, which would also be
-            # true when a month happens to independently detect the same
-            # convention it would have been hinted) is what distinguishes
-            # "this month's own content proved it" from "no evidence, fell
-            # back to a hint."
-            used_hint = "convention_hint=" in hist_month.convention_evidence
-            if used_hint:
-                convention_source = (
-                    f"carried_from_{last_verified_source_key}"
-                    if last_verified_source_key is not None
-                    else "carried_from_unknown"
-                )
-            else:
-                convention_source = "detected"
-                last_verified_convention = hist_month.convention
-                last_verified_source_key = key
+            hist_month = parse_histdata_csv(src.csv_path, instrument, src.year, src.month)
 
             frame = _histdata_month_to_frame(hist_month)
             write_ticks(repo_root, instrument, src.year, src.month, frame)
@@ -463,12 +443,15 @@ def import_histdata(
                 instrument,
                 hist_month,
                 declared_gaps=declared_gaps,
-                convention_source=convention_source,
             )
 
             months_imported += 1
             total_ticks += hist_month.row_count
-            conventions[key] = hist_month.convention
+            stamp_clocks[key] = (
+                hist_month.stamp_clock
+                if hist_month.stamp_clock is not None
+                else "not_required"
+            )
             gap_reports[key] = declared_gaps
 
             month_start_ns = int(hist_month.ts_utc_ns[0])
@@ -484,7 +467,7 @@ def import_histdata(
         months_imported=months_imported,
         months_skipped=tuple(months_skipped),
         total_ticks=total_ticks,
-        conventions=conventions,
+        stamp_clocks=stamp_clocks,
         gap_reports=gap_reports,
         range_start_ns=Nanos(range_start_ns if range_start_ns is not None else 0),
         range_end_ns=Nanos(range_end_ns if range_end_ns is not None else 0),

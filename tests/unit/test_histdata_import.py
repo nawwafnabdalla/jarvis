@@ -92,7 +92,11 @@ def test_reimport_without_force_is_skipped(tmp_path: Path):
 # Provenance -------------------------------------------------------------
 
 
-def test_import_log_records_convention_evidence_sha256(tmp_path: Path):
+def test_import_log_records_stamp_clock_evidence_sha256(tmp_path: Path):
+    """May contains no date on which the US and EU DST calendars
+    disagree, so both stamp clocks convert it identically and no
+    determination is made. The log must say so explicitly rather than
+    leaving a bare null for a reader to interpret."""
     repo_root = tmp_path / "repo"
     source = tmp_path / "source"
     _copy_month_to_dir(source, _MAY_CSV, _MAY_TXT)
@@ -101,11 +105,42 @@ def test_import_log_records_convention_evidence_sha256(tmp_path: Path):
 
     log = read_import_log(repo_root, "GBPUSD", 2017, 5)
     assert log is not None
-    assert log["convention"] == "ny_local"
-    assert "2017-05-05" in log["convention_evidence"]
+    assert log["stamp_clock"] is None
+    assert log["stamp_clock_determination"] == "not_required_both_clocks_agree"
+    assert "no date on which the US and EU DST calendars disagree" in log["stamp_clock_evidence"]
     assert log["source_sha256"] == _sha256_of_file(source / "DAT_ASCII_GBPUSD_T_201705.csv")
     assert log["row_count"] == 5
     assert log["source_filename"] == "DAT_ASCII_GBPUSD_T_201705.csv"
+
+
+def test_import_log_records_a_detected_stamp_clock(tmp_path: Path):
+    """A March file's clock DOES matter, so the log must record which one
+    was detected and the evidence it rested on."""
+    repo_root = tmp_path / "repo"
+    source = tmp_path / "source"
+    source.mkdir(parents=True, exist_ok=True)
+    (source / "DAT_ASCII_GBPUSD_T_202203.csv").write_text(
+        "\n".join(
+            [
+                "20220318 155900000,1.31000,1.31010,0",  # divergent Friday close
+                "20220320 160100000,1.32000,1.32010,0",  # Sunday reopen
+                "20220327 185942410,1.33000,1.33010,0",  # last tick before the switch
+                "20220327 200000088,1.33100,1.33110,0",  # first tick after it
+                "20220328 120000000,1.34000,1.34010,0",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (source / "DAT_ASCII_GBPUSD_T_202203.txt").write_text("", encoding="utf-8")
+
+    import_histdata(repo_root, source, "GBPUSD", start=(2022, 3), end=(2022, 3))
+
+    log = read_import_log(repo_root, "GBPUSD", 2022, 3)
+    assert log["stamp_clock"] == "eu_dst"
+    assert log["stamp_clock_determination"] == "detected_from_file_content"
+    assert "2022-03-18" in log["stamp_clock_evidence"]
+    assert "spring clock switch verified" in log["stamp_clock_evidence"]
 
 
 def test_gap_count_parsed_from_txt(tmp_path: Path):
@@ -132,7 +167,7 @@ def test_directory_of_csvs(tmp_path: Path):
     report = import_histdata(repo_root, source, "GBPUSD")
     assert report.months_found == 2
     assert report.months_imported == 2
-    assert set(report.conventions) == {"2017-05", "2017-06"}
+    assert set(report.stamp_clocks) == {"2017-05", "2017-06"}
 
 
 def test_directory_of_monthly_zips(tmp_path: Path):

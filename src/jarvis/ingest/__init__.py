@@ -13,7 +13,13 @@ from jarvis.ingest.fetch_log import (
     merge_fetch_log,
     read_fetch_log,
 )
-from jarvis.ingest.histdata import HistDataMonth, TzConvention, detect_tz_convention, parse_histdata_csv
+from jarvis.ingest.histdata import (
+    HistDataMonth,
+    StampClock,
+    detect_stamp_clock,
+    month_has_divergent_dates,
+    parse_histdata_csv,
+)
 from jarvis.ingest.histdata_import import (
     TICK_SCHEMA,
     ImportReport,
@@ -40,8 +46,9 @@ __all__ = [
     "RawStatus",
     "Tick",
     "TickArrays",
-    "TzConvention",
-    "detect_tz_convention",
+    "StampClock",
+    "detect_stamp_clock",
+    "month_has_divergent_dates",
     "dukascopy_url",
     "fetch_hour",
     "fetch_log_path",

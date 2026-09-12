@@ -30,7 +30,7 @@ def test_golden_fixture_exact_values(tmp_path):
             _row("20170501 000002001", 1.291170, 1.291310),
         ],
     )
-    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
 
     assert result.row_count == 3
     assert result.instrument == "GBPUSD"
@@ -51,7 +51,7 @@ def test_golden_fixture_exact_values(tmp_path):
 def test_millisecond_precision_preserved(tmp_path):
     csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
     _write_csv(csv_path, [_row("20170501 120000001", 1.30000, 1.30010)])
-    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     # last 3 digits (001) must survive as exactly 1ms = 1_000_000ns
     remainder_ns = int(result.ts_utc_ns[0]) % 1_000_000_000
     assert remainder_ns == 1_000_000
@@ -63,7 +63,7 @@ def test_millisecond_precision_preserved(tmp_path):
 def test_volume_column_mapped_to_null_not_zero(tmp_path):
     csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
     _write_csv(csv_path, [_row("20170501 120000000", 1.30000, 1.30010, volume="0")])
-    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+    result = parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     frame = _histdata_month_to_frame(result)
     assert frame["bid_volume"].null_count() == frame.height
     assert frame["ask_volume"].null_count() == frame.height
@@ -86,7 +86,7 @@ def test_malformed_row_raises_with_line_number(tmp_path):
         ],
     )
     with pytest.raises(IntegrityError) as excinfo:
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     assert "line 2" in str(excinfo.value)
 
 
@@ -100,7 +100,7 @@ def test_malformed_timestamp_field_raises_with_line_number(tmp_path):
         ],
     )
     with pytest.raises(IntegrityError) as excinfo:
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     assert "line 2" in str(excinfo.value)
 
 
@@ -115,16 +115,31 @@ def test_bid_gte_ask_raises(tmp_path):
     rows.append(_row("20170501 235959000", 1.29020, 1.29010))  # isolated bid > ask
     _write_csv(csv_path, rows)
     with pytest.raises(IntegrityError) as excinfo:
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     assert "line 201" in str(excinfo.value)
     assert "bid" in str(excinfo.value).lower()
 
 
-def test_bid_equal_ask_raises(tmp_path):
-    csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
-    _write_csv(csv_path, [_row("20170501 000001000", 1.29000, 1.29000)])
-    with pytest.raises(IntegrityError):
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+def test_bid_equal_ask_is_accepted(tmp_path):
+    """A zero spread is unusual but real, and this is not a hypothetical:
+    the genuine 2009-11 file contains exactly five rows where bid == ask
+    (all on 2009-11-13, around 15:30) and none at all where bid > ask.
+    Rejecting equality made that month unimportable while contradicting
+    detect_column_order's own 1% tolerance, which exists to absorb these
+    quotes. A true inversion (bid > ask) is still corruption -- see
+    test_bid_gte_ask_raises."""
+    csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_200911.csv"
+    _write_csv(
+        csv_path,
+        [
+            _row("20091113 153007000", 1.66910, 1.66920),
+            _row("20091113 153008000", 1.66910, 1.66910),  # zero spread
+            _row("20091113 153009000", 1.66900, 1.66920),
+        ],
+    )
+    result = parse_histdata_csv(csv_path, "GBPUSD", 2009, 11)
+    assert result.row_count == 3
+    assert result.bid[1] == result.ask[1] == pytest.approx(1.66910)
 
 
 def test_non_ascending_timestamps_raises(tmp_path):
@@ -137,7 +152,7 @@ def test_non_ascending_timestamps_raises(tmp_path):
         ],
     )
     with pytest.raises(IntegrityError) as excinfo:
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     assert "line 2" in str(excinfo.value)
     assert "ascending" in str(excinfo.value).lower()
 
@@ -152,7 +167,7 @@ def test_wrong_month_for_filename_raises(tmp_path):
         ],
     )
     with pytest.raises(IntegrityError) as excinfo:
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
     assert "line 2" in str(excinfo.value)
 
 
@@ -160,7 +175,7 @@ def test_empty_file_raises(tmp_path):
     csv_path = tmp_path / "DAT_ASCII_GBPUSD_T_201705.csv"
     csv_path.write_text("", encoding="utf-8")
     with pytest.raises(IntegrityError):
-        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5, convention_hint="ny_local")
+        parse_histdata_csv(csv_path, "GBPUSD", 2017, 5)
 
 
 # detect_column_order (WP-009-CORRECTION finding 2) -------------------------
