@@ -1,14 +1,21 @@
 """HistData.com bulk import orchestration: source discovery (a zip of
 monthly zips, a directory of monthly zips, or a directory of already-
-extracted CSVs), tick Parquet writing with merge semantics (D-045), and
-per-month provenance logging.
+extracted CSVs), tick Parquet writing with merge semantics, and per-month
+provenance logging.
 
 Writes into the tick Parquet layer at
 data/tick/instrument={instrument}/year={YYYY}/month={MM}/data.parquet,
 using the column names/dtypes jarvis.ingest.parse.parse_bi5_arrays'
-TickArrays already establishes (ts_utc_ns, bid, ask, bid_volume,
-ask_volume) so the schema is identical regardless of which ingest path
-produced it.
+TickArrays establishes (ts_utc_ns, bid, ask, bid_volume, ask_volume) PLUS
+one column TickArrays does not carry: row_sequence (WP-009g / D-058). The
+two schemas are no longer byte-identical, and that is deliberate, not
+drift: TickArrays is an ephemeral in-memory array that never persists to
+Parquet (resample_range reads .bi5 blobs directly -- see the note below),
+so its own tie-breaker (Tick.seq, jarvis.ingest.parse) never needs to
+survive a round trip and is never stored. write_ticks DOES persist to
+Parquet and merges across repeated calls, so its tie-breaker must be an
+actual column or it cannot survive being written, read back, and merged
+again. See write_ticks for why one is needed at all.
 
 NOTE ON DOWNSTREAM WIRING (flagged, not silently worked around): as of
 this package, jarvis.bars.resample_range reads raw .bi5 blobs directly
@@ -45,7 +52,26 @@ TICK_SCHEMA: dict[str, pl.DataType] = {
     "ask": pl.Float64,
     "bid_volume": pl.Float64,
     "ask_volume": pl.Float64,
+    # WP-009g / D-058: the tick's 0-indexed position within its SOURCE
+    # FILE for the month, i.e. exactly what jarvis.ingest.parse.Tick.seq
+    # already means for the Dukascopy path -- an honest record of file
+    # order, never a timestamp and never implying precision finer than
+    # ts_utc_ns's real millisecond resolution. See write_ticks.
+    "row_sequence": pl.Int64,
 }
+
+# A tick file predating WP-009g has no row_sequence column at all. Merging
+# it against a fresh frame would either crash on a polars schema mismatch
+# or (worse) silently coerce nulls into the compound dedup key below --
+# see write_ticks's guard.
+_LEGACY_SCHEMA_ERROR = (
+    "predates the row_sequence tiebreaker (WP-009g / D-058) and cannot be "
+    "safely merged against -- data written under the OLD ts_utc_ns-only dedup "
+    "key may already have silently discarded genuine same-millisecond quotes "
+    "it has no way to recover now. Delete this file and re-import the month "
+    "from scratch rather than merging fresh data onto data that might "
+    "already be lossy."
+)
 
 _WRITE_PARQUET_KWARGS = {
     "compression": "zstd",
@@ -109,21 +135,85 @@ def _month_key(year: int, month: int) -> str:
 
 def write_ticks(repo_root: Path, instrument: str, year: int, month: int, frame: pl.DataFrame) -> Path:
     """Write one month of ticks, atomically, MERGING with any existing
-    month file rather than replacing it (D-045 -- write_bars' own silent-
-    data-loss bug is exactly what this guards against): existing rows and
-    `frame`'s rows are concatenated, deduplicated on ts_utc_ns keeping
-    `frame`'s row for any collision (a re-import must win), sorted
-    ascending."""
+    month file rather than replacing it wholesale (the same merge-not-
+    replace shape D-045 established for write_bars, in a genuinely
+    different function in a different module -- see this function's
+    history note below for why that distinction matters).
+
+    THE DEDUP KEY IS (ts_utc_ns, row_sequence), NOT ts_utc_ns ALONE
+    (WP-009g / D-058). A HistData millisecond stamp is not always unique:
+    WP-009f measured up to 38% of a month's rows genuinely sharing a
+    stamp with a DIFFERENT quote in specific 2006-2011 windows (unrelated
+    to volatility, confirmed independent of the DST-calendar and column-
+    order regimes), and confirmed the mechanism is a plain integer
+    collision on millisecond-resolution source stamps -- not a permanent
+    property of the market. Deduping on ts_utc_ns alone (the ORIGINAL
+    version of this function) silently discarded every genuine quote but
+    the last at each colliding stamp. row_sequence is that tick's real,
+    honest position in its source file -- not a fabricated timestamp, and
+    it never implies precision finer than ts_utc_ns's real millisecond
+    resolution. WP-009f confirmed file order behaves as a real
+    chronological signal (within-group and between-group price-step
+    statistics were indistinguishable), so this recovers real information
+    rather than inventing an arbitrary tiebreak.
+
+    A TRUE full duplicate -- identical ts_utc_ns AND bid AND ask, a
+    literally repeated row rather than a distinct quote -- is still
+    collapsed to one row, exactly as before: it carries no information
+    the compound key would need to preserve. Only genuinely DIFFERING
+    same-millisecond rows are now kept as separate rows. On a re-import
+    of the same month, the newer frame's row still wins at any shared
+    (ts_utc_ns, row_sequence) identity, preserving the original "a
+    re-import must win" guarantee.
+
+    Raises IntegrityError if an existing on-disk file predates
+    row_sequence (see _LEGACY_SCHEMA_ERROR) -- merging fresh, honest data
+    onto data written under the lossy old key must never happen silently;
+    the file must be rebuilt from source, not patched.
+
+    HISTORY: write_ticks and write_bars (jarvis.bars.store) share this
+    merge-then-dedup-then-sort SHAPE because write_ticks was written by
+    following write_bars' established pattern -- but they are separate
+    functions in separate modules, storing structurally different things.
+    D-045 fixed write_bars' replace-instead-of-merge defect; it never
+    reviewed, and says nothing about, EITHER function's dedup KEY choice.
+    For bars, keying on ts_utc_ns is simply correct: a 1-minute bar has
+    exactly one instance per minute by construction. For raw ticks that
+    invariant never held -- multiple genuinely distinct quotes can share
+    a millisecond -- and nothing caught it because write_ticks's dedup
+    key had never been independently reviewed until WP-009f found the
+    gap it was causing. Do not cite D-045 as having examined this key."""
     path = tick_path(repo_root, instrument, year, month)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.is_file():
         existing = pl.read_parquet(path)
+        if "row_sequence" not in existing.columns:
+            raise IntegrityError(f"{path}: {_LEGACY_SCHEMA_ERROR}")
         combined = pl.concat([existing, frame])
     else:
         combined = frame
 
-    merged = combined.unique(subset=["ts_utc_ns"], keep="last", maintain_order=True).sort("ts_utc_ns")
+    # Step 1: collapse TRUE full duplicates -- identical ts_utc_ns, bid,
+    # AND ask -- to a single row. These carry zero additional information
+    # regardless of how many times they repeat or where, so this loses
+    # nothing; it is exactly what "as today" meant for this case. Sorting
+    # by row_sequence first makes keep="last" deterministically prefer
+    # the highest row_sequence at each (ts_utc_ns, bid, ask) triple --
+    # the newer import, on a re-import of the same month.
+    combined = combined.sort("row_sequence")
+    combined = combined.unique(subset=["ts_utc_ns", "bid", "ask"], keep="last", maintain_order=True)
+
+    # Step 2: resolve the real identity key. After step 1, two rows can
+    # still legitimately share ts_utc_ns (a genuine same-millisecond
+    # collision with a different quote) -- that is no longer an error to
+    # collapse away. row_sequence disambiguates them, and is ALSO what
+    # lets a re-import of the same month replace stale existing rows at
+    # matching (ts_utc_ns, row_sequence) identity, keeping "a re-import
+    # must win" intact.
+    merged = combined.unique(
+        subset=["ts_utc_ns", "row_sequence"], keep="last", maintain_order=True
+    ).sort(["ts_utc_ns", "row_sequence"])
 
     tmp_path = path.with_name(path.name + ".tmp")
     try:
@@ -144,6 +234,12 @@ def _histdata_month_to_frame(hist_month: HistDataMonth) -> pl.DataFrame:
             "ask": hist_month.ask,
             "bid_volume": [None] * n,
             "ask_volume": [None] * n,
+            # 0-indexed position in THIS parse of the source file.
+            # parse_histdata_csv never reorders rows (WP-009's own
+            # invariant), so index i here IS row i of the CSV -- an
+            # honest record of file order, not a guess and not a
+            # timestamp. See write_ticks (WP-009g / D-058).
+            "row_sequence": range(n),
         },
         schema=TICK_SCHEMA,
     )

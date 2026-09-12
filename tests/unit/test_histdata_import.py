@@ -6,12 +6,15 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from jarvis.core.errors import IntegrityError
 from jarvis.core.hashing import sha256_file
 from jarvis.ingest.histdata_import import (
+    TICK_SCHEMA,
     import_histdata,
     import_log_path,
     read_import_log,
     tick_path,
+    write_ticks,
 )
 
 _FIXTURE_DIR = Path(__file__).resolve().parents[1] / "fixtures" / "histdata"
@@ -38,7 +41,148 @@ def _sha256_of_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-# Merge semantics (D-045) ----------------------------------------------
+# Merge semantics -------------------------------------------------------
+#
+# write_ticks and write_bars (jarvis.bars.store) share a merge-then-dedup
+# -then-sort SHAPE -- write_ticks was written by copying write_bars'
+# established pattern -- but they are separate functions in separate
+# modules, storing structurally different things, and D-045 (which fixed
+# write_bars' replace-instead-of-merge defect) never reviewed either
+# function's DEDUP KEY choice. The tests below exercise write_ticks
+# directly; see write_ticks's own docstring for the full lineage note.
+
+
+def _tick_frame(rows: list[tuple[int, float, float]]) -> pl.DataFrame:
+    """Build a minimal, schema-correct tick frame from (ts_utc_ns, bid,
+    ask) tuples. row_sequence is 0-indexed by construction order, exactly
+    as _histdata_month_to_frame produces it from real source-file order."""
+    return pl.DataFrame(
+        {
+            "ts_utc_ns": [r[0] for r in rows],
+            "bid": [r[1] for r in rows],
+            "ask": [r[2] for r in rows],
+            "bid_volume": [None] * len(rows),
+            "ask_volume": [None] * len(rows),
+            "row_sequence": range(len(rows)),
+        },
+        schema=TICK_SCHEMA,
+    )
+
+
+def test_write_ticks_preserves_distinct_same_millisecond_quotes(tmp_path: Path):
+    """WP-009g / D-058: two rows sharing ts_utc_ns but carrying DIFFERENT
+    quotes are the exact case the old ts_utc_ns-only dedup key silently
+    discarded (WP-009f measured up to 38% of a month lost this way). Both
+    must now survive, distinguished by row_sequence."""
+    repo_root = tmp_path / "repo"
+    frame = _tick_frame(
+        [
+            (1_000_000_000_000, 1.30000, 1.30010),  # same ts_utc_ns,
+            (1_000_000_000_000, 1.29990, 1.30000),  # genuinely different quote
+        ]
+    )
+    write_ticks(repo_root, "GBPUSD", 2010, 4, frame)
+
+    on_disk = pl.read_parquet(tick_path(repo_root, "GBPUSD", 2010, 4))
+    assert on_disk.height == 2
+    assert set(on_disk["ts_utc_ns"].to_list()) == {1_000_000_000_000}
+    assert sorted(on_disk["bid"].to_list()) == [1.29990, 1.30000]
+    assert sorted(zip(on_disk["ts_utc_ns"], on_disk["row_sequence"])) == [
+        (1_000_000_000_000, 0),
+        (1_000_000_000_000, 1),
+    ]
+
+
+def test_write_ticks_still_dedupes_true_full_duplicates(tmp_path: Path):
+    """A TRUE full duplicate -- identical ts_utc_ns AND bid AND ask, a
+    literally repeated row rather than a distinct quote -- must still
+    collapse to one row, exactly as before this fix. It carries no
+    information the compound key needs to preserve."""
+    repo_root = tmp_path / "repo"
+    frame = _tick_frame(
+        [
+            (1_000_000_000_000, 1.30000, 1.30010),
+            (1_000_000_000_000, 1.30000, 1.30010),  # byte-identical repeat
+        ]
+    )
+    write_ticks(repo_root, "GBPUSD", 2010, 4, frame)
+
+    on_disk = pl.read_parquet(tick_path(repo_root, "GBPUSD", 2010, 4))
+    assert on_disk.height == 1
+    assert on_disk["ts_utc_ns"][0] == 1_000_000_000_000
+    assert on_disk["bid"][0] == pytest.approx(1.30000)
+    assert on_disk["ask"][0] == pytest.approx(1.30010)
+
+
+def test_write_ticks_mixed_collisions_and_duplicates_reduced_scale_2010_04(tmp_path: Path):
+    """Regression fixture at reduced scale for the real 2010-04 shape
+    (WP-009f: 38.0% of that month's rows were genuine collisions). One
+    millisecond carries three genuinely different quotes (all must
+    survive); a second millisecond carries a real quote plus one true
+    full duplicate of it (must collapse to two rows, not three); a third
+    millisecond is an ordinary single tick (unaffected)."""
+    repo_root = tmp_path / "repo"
+    frame = _tick_frame(
+        [
+            (2_000_000_000_000, 1.51110, 1.51140),  # group A: 3 distinct quotes
+            (2_000_000_000_000, 1.51120, 1.51150),
+            (2_000_000_000_000, 1.51100, 1.51130),
+            (2_000_060_000_000, 1.53180, 1.53240),  # group B: quote + its own duplicate
+            (2_000_060_000_000, 1.53170, 1.53230),
+            (2_000_060_000_000, 1.53170, 1.53230),  # true duplicate of the row above
+            (2_000_120_000_000, 1.52000, 1.52010),  # group C: ordinary, no collision
+        ]
+    )
+    write_ticks(repo_root, "GBPUSD", 2010, 4, frame)
+
+    on_disk = pl.read_parquet(tick_path(repo_root, "GBPUSD", 2010, 4)).sort(
+        ["ts_utc_ns", "row_sequence"]
+    )
+    # 3 (all distinct) + 2 (one true duplicate collapsed) + 1 (ordinary) = 6
+    assert on_disk.height == 6
+    group_a = on_disk.filter(pl.col("ts_utc_ns") == 2_000_000_000_000)
+    assert group_a.height == 3
+    assert sorted(group_a["bid"].to_list()) == [1.51100, 1.51110, 1.51120]
+    group_b = on_disk.filter(pl.col("ts_utc_ns") == 2_000_060_000_000)
+    assert group_b.height == 2
+    assert sorted(group_b["bid"].to_list()) == [1.53170, 1.53180]
+    group_c = on_disk.filter(pl.col("ts_utc_ns") == 2_000_120_000_000)
+    assert group_c.height == 1
+
+
+def test_write_ticks_reimport_still_wins_under_compound_key(tmp_path: Path):
+    """The original "a re-import must win" guarantee must survive the key
+    change: re-writing the same (ts_utc_ns, row_sequence) identity with a
+    corrected price must replace the stale row, not add a second one."""
+    repo_root = tmp_path / "repo"
+    write_ticks(repo_root, "GBPUSD", 2010, 4, _tick_frame([(1_000_000_000_000, 1.30000, 1.30010)]))
+    write_ticks(
+        repo_root, "GBPUSD", 2010, 4, _tick_frame([(1_000_000_000_000, 1.31111, 1.31121)])
+    )  # same ts_utc_ns AND row_sequence=0 -- a correction to the same tick, not a new one
+
+    on_disk = pl.read_parquet(tick_path(repo_root, "GBPUSD", 2010, 4))
+    assert on_disk.height == 1
+    assert on_disk["bid"][0] == pytest.approx(1.31111)
+
+
+def test_write_ticks_refuses_to_merge_against_pre_row_sequence_schema(tmp_path: Path):
+    """A tick file written before WP-009g has no row_sequence column.
+    Merging fresh data onto it must fail loudly, naming the reason --
+    never silently coerce nulls into the new key or crash with an opaque
+    polars schema-mismatch error. The file must be rebuilt from source."""
+    repo_root = tmp_path / "repo"
+    path = tick_path(repo_root, "GBPUSD", 2010, 4)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    legacy = pl.DataFrame(
+        {"ts_utc_ns": [1_000_000_000_000], "bid": [1.3], "ask": [1.31],
+         "bid_volume": [None], "ask_volume": [None]},
+        schema={"ts_utc_ns": pl.Int64, "bid": pl.Float64, "ask": pl.Float64,
+                "bid_volume": pl.Float64, "ask_volume": pl.Float64},
+    )
+    legacy.write_parquet(path)
+
+    with pytest.raises(IntegrityError, match="row_sequence"):
+        write_ticks(repo_root, "GBPUSD", 2010, 4, _tick_frame([(2_000_000_000_000, 1.3, 1.31)]))
 
 
 def test_two_months_import_both_present(tmp_path: Path):
@@ -257,19 +401,24 @@ def test_start_end_range_filters_months(tmp_path: Path):
 # Output schema (acceptance criterion 4) ------------------------------------
 
 
-def test_output_schema_matches_tick_columns(tmp_path: Path):
-    from jarvis.ingest.parse import TickArrays
-
+def test_output_schema_matches_tick_columns_plus_row_sequence(tmp_path: Path):
+    """The on-disk schema is TickArrays' columns PLUS row_sequence
+    (WP-009g / D-058) -- deliberately not byte-identical to TickArrays
+    any more. TickArrays never persists to Parquet (it's an ephemeral
+    per-hour array; resample_range reads .bi5 blobs directly), so it
+    never needed a stored tie-breaker column the way write_ticks's
+    merged, persisted store does."""
     repo_root = tmp_path / "repo"
     source = tmp_path / "source"
     _copy_month_to_dir(source, _MAY_CSV, _MAY_TXT)
     import_histdata(repo_root, source, "GBPUSD", start=(2017, 5), end=(2017, 5))
 
     df = pl.read_parquet(tick_path(repo_root, "GBPUSD", 2017, 5))
-    tickarrays_columns = {"ts_utc_ns", "bid", "ask", "bid_volume", "ask_volume"}
-    assert set(df.columns) == tickarrays_columns
+    expected_columns = {"ts_utc_ns", "bid", "ask", "bid_volume", "ask_volume", "row_sequence"}
+    assert set(df.columns) == expected_columns
     assert df.schema["ts_utc_ns"] == pl.Int64
     assert df.schema["bid"] == pl.Float64
     assert df.schema["ask"] == pl.Float64
     assert df.schema["bid_volume"] == pl.Float64
     assert df.schema["ask_volume"] == pl.Float64
+    assert df.schema["row_sequence"] == pl.Int64
