@@ -11,8 +11,7 @@ from pathlib import Path
 import polars as pl
 import typer
 
-from jarvis.bars.resample import resample_range
-from jarvis.bars.store import read_bars
+from jarvis.bars import read_bars, resample_range
 from jarvis.core.config import load_instruments, load_periods, repo_root
 from jarvis.core.errors import ConfigError, JarvisError, OutputError, UserError
 from jarvis.core.hashing import sha256_file
