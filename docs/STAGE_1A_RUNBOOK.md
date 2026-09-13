@@ -14,41 +14,47 @@ and approved.
 
 ---
 
-## 0. BLOCKING PRE-FLIGHT ISSUE — must be fixed before this runbook can run
+## 0. Pre-flight issue — RESOLVED (WP-012 / D-061, commit `a98f23e`)
 
-Verifying the actual current source (not just the CLI, as required, but the
-code each CLI command calls) surfaced a real defect that would silently
-invalidate the entire run if not fixed first. This is reported here rather
-than worked around, per this project's standing rule.
+**This blocker is fixed. This section is a historical record of what it was
+and how it was closed, kept so the reasoning stays visible — it is not a
+live blocker and nothing below requires re-checking it before running.**
 
-**`jarvis.probe.report.year_admissibility`** (called internally by
-`run_probe`, which is what `jarvis stage0 probe` invokes) determines whether
-a year counts toward the gate's percentile statistics using two checks:
+Verifying the actual current source when this runbook was first written
+(not just the CLI, as required, but the code each CLI command calls)
+surfaced a real defect that would have silently invalidated the entire run.
+It was reported here rather than worked around, per this project's standing
+rule, and fixed in the very next package rather than during the run itself.
 
-1. `jarvis.qa.run_checks` reports zero ERROR findings for that year — this
-   half was correctly retargeted to `data/tick/` by WP-010/D-060.
-2. **`_hours_present_ratio`**, which was *not* touched by WP-009 or WP-010
-   (neither package's file scope included `probe/`) — it still calls
-   `jarvis.ingest.urls.raw_blob_path` and checks for a **Dukascopy `.bi5`
-   blob** on disk for every trading-week hour, requiring ≥95% presence.
+**What was wrong:** `jarvis.probe.report.year_admissibility` (called
+internally by `run_probe`, which is what `jarvis stage0 probe` invokes)
+determines whether a year counts toward the gate's percentile statistics
+using two checks: `jarvis.qa.run_checks` reporting zero ERROR findings
+(correctly retargeted to `data/tick/` by WP-010/D-060), and a presence
+check that — until this fix — still called `jarvis.ingest.urls.raw_blob_path`
+and checked for a **Dukascopy `.bi5` blob** on disk for every trading-week
+hour, requiring ≥95% presence. `data/raw/ticks/GBPUSD/` held 224 leftover
+files from an unrelated 2024-01 diagnostic and zero real 2006–2022 coverage,
+so every year measured a 0.0 ratio and failed admissibility before
+`run_checks` was ever reached. With `_MIN_ADMISSIBLE_YEARS = 12` and zero
+years ever passing, `evaluate_gate` returned `INSUFFICIENT_DATA`
+unconditionally, regardless of how complete the real dataset actually was.
 
-Checked directly against the actual repository state: `data/raw/ticks/GBPUSD/`
-contains **224 files, all from 2024-01** (leftover from early diagnostic work
-in this project) — **zero** coverage of 2006–2022. Every year in the Stage 0
-range would measure a 0.0 hours-present ratio and fail admissibility before
-`run_checks` is even reached. With `_MIN_ADMISSIBLE_YEARS = 12`
-(`src/jarvis/probe/gate.py`) and zero years passing, `evaluate_gate` returns
-**`INSUFFICIENT_DATA`** unconditionally — a wrong, misleading result that
-looks like a real data problem but is actually a stale check that predates
-the HistData migration.
+**The fix (WP-012 / D-061):** the presence check was retargeted to
+`data/tick/`, reusing WP-010's own "a hole is a wholly-missing month" model
+(`tick_path(...).is_file()` per calendar month) instead of Dukascopy blob
+presence. Verified directly: a regression test builds 20 years of realistic
+synthetic `data/tick/` coverage and confirms `evaluate_gate` no longer
+returns `INSUFFICIENT_DATA` unconditionally — it would have failed against
+that exact test before this fix. Full decision-log entry: **D-061**
+(`docs/DECISION_LOG.md`).
 
-**This must be fixed by a follow-up code package before Step 4 (Probe) is
-run** — retargeting `_hours_present_ratio` (or replacing it outright) to
-check `data/tick/` month presence, the same move WP-010 already made for
-`resample_range` and `run_checks`, is the obvious shape but is **not**
-decided here; WP-011's file scope is `docs/STAGE_1A_RUNBOOK.md` only, so no
-code change is proposed or made by this document. Steps 1–3 below (Resample,
-Validate, Features) do not touch this code path and are not blocked by it.
+**Same package also closed the vault-boundary enforcement gap** referenced
+in Section 6.C below — see that section's own updated text, and **D-061a**
+for the one residual, deliberately-deferred limitation (enforcement is
+CLI-level, not embedded in `resample_range`/`run_checks`/`compute`
+themselves — irrelevant to this runbook specifically, since every step below
+runs through the CLI, never a direct Python call).
 
 ---
 
@@ -275,18 +281,27 @@ full year with no admissibility failure, stop — one of those is a hard
 contradiction and the other is very unlikely to be a genuine result.
 
 **C. Confirm no vault-sealed data was touched — from the actual commands run,
-not from assuming the boundary held.** Only `jarvis stage0 probe` has a
-code-level refusal above `2023-01-01T00:00:00Z` (Section 2). Steps 1–3 have
-**no such check at all** — `data resample`, `data validate`, and `features
-build` will process any range they are given, including one that reaches
-into 2023+, without complaint. There is no `GatedReader` or vault-access
-audit log implemented yet (D-036a defers it to Stage 1E, which does not
-exist) — so this confirmation is necessarily a manual cross-check of the
-actual `--to` value passed in every command actually invoked during the run
-(the terminal transcript, and each report's own printed range: resample and
-validate echo `--from`/`--to` back at the top of their output; the probe and
-features reports both record `Dataset range` in their own metadata section)
-against `2023-01-01T00:00:00Z`. Confirm every single one is `<=` that value
+not from assuming the boundary held.** **Updated by WP-012/D-061 (commit
+`a98f23e`):** all four commands now have a code-level refusal above
+`2023-01-01T00:00:00Z` — `reject_vault_range` (`probe/report.py`), called by
+`data resample`, `data validate`, `features build`, and `stage0 probe` alike.
+This was previously true only for `stage0 probe`; the other three would have
+processed a >2023 range without complaint. The remaining, deliberately-
+deferred limitation (**D-061a**) is that this enforcement lives at the CLI
+entry point, not inside `resample_range`/`run_checks`/`compute` themselves —
+**not a gap for this runbook specifically**, since every command below is
+invoked through the `jarvis` CLI, never a direct Python call, so the code-
+level check is live for every step here. There is still no `GatedReader` or
+vault-access audit log (D-036a defers that to Stage 1E, which does not
+exist), so the confirmation below is still a manual cross-check — now
+confirming the code-level guard actually fired as expected on every
+invocation, not compensating for its total absence on three of four
+commands. Cross-check the actual `--to` value passed in every command
+actually invoked during the run (the terminal transcript, and each report's
+own printed range: resample and validate echo `--from`/`--to` back at the
+top of their output; the probe and features reports both record `Dataset
+range` in their own metadata section) against `2023-01-01T00:00:00Z`.
+Confirm every single one is `<=` that value
 before treating D-042 as final. This is a real gap worth naming plainly: the
 vault boundary is enforced by code for exactly one of the four steps, and by
 runbook discipline alone for the other three.
