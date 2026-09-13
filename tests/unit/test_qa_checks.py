@@ -595,21 +595,43 @@ def test_w05_no_finding_when_all_days_normal():
     assert _find(findings, "W-05") is None
 
 
-# I-01 ---------------------------------------------------------------------
+# I-01 -- WP-014 redesign: flags LEAKED (unexpected nonzero) bar activity
+# on a DST-transition trading day's own (market-closed) label, rather than
+# comparing against a full-day expectation that label can never meet.
+# ---------------------------------------------------------------------------
 
 
-def test_i01_fires_on_dst_transition_day_with_wrong_bar_count():
-    # 2023-03-12 is the US spring-forward Sunday: a 23-hour trading day.
-    dst_day = date(2023, 3, 12)
+def _dst_transition_days(start: date, count: int) -> list[date]:
+    """Real DST-transition trading-day labels, found the same way
+    _check_dst_day itself finds them (trading_day_bounds' own computed
+    span != 1440 minutes) -- not a hardcoded date list that could drift
+    from the actual historical US rules."""
+    from datetime import timedelta
+
+    days: list[date] = []
+    d = start
+    while len(days) < count:
+        s, e = trading_day_bounds(d)
+        if (e - s) // NS_PER_MINUTE != 1440:
+            days.append(d)
+        d = d + timedelta(days=1)
+    return days
+
+
+def test_i01_confirms_clean_when_dst_sunday_has_zero_bars():
+    """The real, expected case (confirmed against the actual archive in
+    WP-014: 0 of 33 flagged) -- a DST-transition Sunday with no bars on
+    its own label. I-01 must still appear (positive confirmation, not
+    silence) with count=0."""
+    dst_day = date(2023, 3, 12)  # US spring-forward Sunday, a 23h label
     s, e = trading_day_bounds(dst_day)
-    expected_minutes = (e - s) // NS_PER_MINUTE
-    assert expected_minutes == 23 * 60
+    assert (e - s) // NS_PER_MINUTE == 23 * 60
 
-    rows = [_bar_row(s + m * NS_PER_MINUTE) for m in range(100)]  # deliberately far off
-
-    normal_day = date(2023, 3, 8)  # an ordinary Wednesday, also given a "wrong" count
+    # Bars exist on an ordinary surrounding day, never on the DST Sunday
+    # label itself.
+    normal_day = date(2023, 3, 8)
     ns, ne = trading_day_bounds(normal_day)
-    rows += [_bar_row(ns + m * NS_PER_MINUTE) for m in range(50)]
+    rows = [_bar_row(ns + m * NS_PER_MINUTE) for m in range(50)]
 
     bars = _bars_frame(rows)
     findings = bar_level_checks(bars, ns, e, thin_day_threshold=0.60)
@@ -617,21 +639,64 @@ def test_i01_fires_on_dst_transition_day_with_wrong_bar_count():
     i01 = _find(findings, "I-01")
     assert i01 is not None
     assert i01.severity == "INFO"
+    assert i01.count == 0
+    assert i01.sample == ()
+    assert "0 of" in i01.detail
+    assert "confirms" in i01.detail
+
+
+def test_i01_flags_leaked_bars_on_dst_sunday():
+    """WP-014's required proof that the redesign actually catches the
+    failure mode it exists for: if trading_day_bounds or the day-
+    bucketing search ever mis-locates a DST-adjusted boundary, real bars
+    leak onto the closed Sunday label -- inject exactly that and confirm
+    I-01 flags it specifically, not the ordinary day beside it."""
+    dst_day = date(2023, 11, 5)  # US fall-back Sunday, a 25h label
+    s, e = trading_day_bounds(dst_day)
+    assert (e - s) // NS_PER_MINUTE == 25 * 60
+
+    # Simulates a boundary-leakage bug: three bars land inside the
+    # Sunday-labelled bounds, which should be entirely bar-free.
+    leaked_rows = [_bar_row(s + m * NS_PER_MINUTE) for m in range(3)]
+
+    normal_day = date(2023, 11, 1)  # an ordinary Wednesday, populated normally
+    ns, _ne = trading_day_bounds(normal_day)
+    normal_rows = [_bar_row(ns + m * NS_PER_MINUTE) for m in range(50)]
+
+    bars = _bars_frame(leaked_rows + normal_rows)
+    findings = bar_level_checks(bars, ns, e, thin_day_threshold=0.60)
+
+    i01 = _find(findings, "I-01")
+    assert i01 is not None
+    assert i01.severity == "INFO"
     assert i01.count == 1
     assert dst_day.isoformat() in i01.sample[0]
+    assert "actual_bars=3" in i01.sample[0]
     assert normal_day.isoformat() not in " ".join(i01.sample)
 
 
-def test_i01_does_not_fire_on_correctly_populated_dst_day():
-    dst_day = date(2023, 11, 5)  # US fall-back Sunday: a 25-hour trading day
-    s, e = trading_day_bounds(dst_day)
-    expected_minutes = (e - s) // NS_PER_MINUTE
-    assert expected_minutes == 25 * 60
+def test_i01_count_not_capped_past_ten():
+    """WP-014: the sibling of WP-013's E-01/count-cap bug -- I-01's count
+    used to be len() of the very list its samples were capped into.
+    Confirms the fix against 12 real DST-transition days (more than the
+    old 10-sample cap), all leaked, all counted."""
+    days = _dst_transition_days(date(2007, 1, 1), 12)
+    assert len(days) == 12
 
-    rows = [_bar_row(s + m * NS_PER_MINUTE) for m in range(expected_minutes)]
+    rows = []
+    for d in days:
+        s, _e = trading_day_bounds(d)
+        rows.append(_bar_row(s))  # one leaked bar on each DST Sunday label
+
+    start_ns, _ = trading_day_bounds(days[0])
+    _, end_ns = trading_day_bounds(days[-1])
     bars = _bars_frame(rows)
-    findings = bar_level_checks(bars, s, e, thin_day_threshold=0.60)
-    assert _find(findings, "I-01") is None
+    findings = bar_level_checks(bars, start_ns, end_ns, thin_day_threshold=0.60)
+
+    i01 = _find(findings, "I-01")
+    assert i01 is not None
+    assert i01.count == 12  # not capped at 10
+    assert len(i01.sample) == 12
 
 
 def test_bar_level_checks_empty_frame_returns_no_findings():

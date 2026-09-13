@@ -29,7 +29,6 @@ _WEEKEND_BUFFER_NS = 5 * NS_PER_MINUTE  # W-03: buffer on is_weekend_gap's exact
 _EXTREME_SPREAD_MULTIPLE = 20  # W-04
 _EXTREME_SPREAD_MIN_BUCKET = 100  # W-04: minimum bars per hour-of-week bucket
 _THIN_DAY_BASELINE = 20  # W-05: trailing trading days required
-_DST_DEVIATION_FRACTION = 0.4  # I-01
 
 
 @dataclass(frozen=True, slots=True)
@@ -734,44 +733,92 @@ def _check_thin_day(
 def _check_dst_day(
     all_days: list[date], day_to_count: dict[date, int], start_ns: Nanos, end_ns: Nanos
 ) -> list[Finding]:
-    """I-01 (Correction 3): a trading day containing a DST transition is 23
-    or 25 hours long, not 24 -- confirmed by trading_day_bounds, not by any
-    hardcoded transition date. Flags INFO when the present-bar count
-    deviates from the day's own expected-duration-in-minutes by more than
-    _DST_DEVIATION_FRACTION. The point is to confirm the time engine and
-    the resampler agree about DST-affected days, not to detect a market
-    anomaly -- so this never touches ERROR/WARNING severity."""
-    candidates = _fully_contained(all_days, start_ns, end_ns)
-    deviated: list[str] = []
-    dst_day_count = 0
+    """I-01 -- WP-014 redesign, superseding the original (Correction 3)
+    version entirely.
 
+    A trading day LABELLED for a DST-transition date is genuinely 23 or 25
+    hours long, not 24 -- confirmed by trading_day_bounds, not by any
+    hardcoded transition date. The original check compared that label's
+    actual bar count against a full-day-of-trading expectation. That
+    comparison was never meaningful: every US DST transition falls on a
+    Sunday, and a Sunday-labelled trading day's bounds (previous-calendar-
+    day 17:00 NY through same-day 17:00 NY) sit ENTIRELY inside
+    is_weekend_gap's closure (a subset of Fri17:00-Sun17:00 NY) --
+    W-05 already excludes Sat/Sun labels from its own thin-day check for
+    the identical reason. The market being closed there has nothing to do
+    with DST. WP-011's real Stage 1A run demonstrated this directly: 33 of
+    33 DST-transition Sundays in 2006-2022 "failed" the old check, every
+    one with actual_bars=0 -- the correct, expected outcome, not a defect,
+    and a bug in HOW the check counted (WP-014, see finalize()'s sibling
+    fix) had silently hidden even that real number until now.
+
+    Redirecting to the following Monday instead was investigated and
+    rejected: trading_day_bounds(monday) computes BOTH its boundary
+    instants (Sunday 17:00 NY, Monday 17:00 NY) from local times already
+    past the transition, so Monday's own duration is always a plain 24h
+    regardless of whether the transition was handled correctly --
+    checking it would just be a weaker, redundant copy of W-05, not a
+    DST-specific signal.
+
+    WP-014's redesign flips the comparison instead of relocating it: the
+    true expectation for a DST-transition Sunday's label is not "close to
+    a full day" but EXACTLY ZERO bars, deterministically, no threshold to
+    tune -- since it is provably, entirely inside market closure. If
+    trading_day_bounds or bar_level_checks' own day-bucketing search ever
+    mis-locates the DST-adjusted boundary, the failure mode is REAL
+    activity leaking into this label, which is exactly what this now
+    checks for directly. Checked against the real archive: 0 of 33
+    flagged -- for the first time, positive evidence the boundary
+    computation is correct, not a check that fired unconditionally for a
+    reason unrelated to what it claims to test.
+
+    Always emits one Finding when at least one DST-transition day is in
+    range, even when nothing is flagged -- an explicit exception to every
+    other check's own "no finding when count is zero" convention, since a
+    confirmed-clean result here is itself the useful information (this
+    project's stated preference for verified evidence over silence)."""
+    candidates = _fully_contained(all_days, start_ns, end_ns)
+    dst_days: list[date] = []
     for d in candidates:
         s, e = trading_day_bounds(d)
-        duration_minutes = (e - s) // NS_PER_MINUTE
-        if duration_minutes == 1440:
-            continue
-        dst_day_count += 1
-        expected = duration_minutes
-        actual = day_to_count.get(d, 0)
-        if expected and abs(actual - expected) > _DST_DEVIATION_FRACTION * expected:
-            deviated.append(
-                f"{d.isoformat()} expected~{expected}min actual_bars={actual}"
-            )
+        if (e - s) // NS_PER_MINUTE != 1440:
+            dst_days.append(d)
 
-    if not deviated:
+    if not dst_days:
         return []
+
+    leaked: list[str] = []
+    leaked_count = 0
+    for d in dst_days:
+        actual = day_to_count.get(d, 0)
+        if actual > 0:
+            leaked_count += 1
+            leaked.append(f"{d.isoformat()} actual_bars={actual} (expected exactly 0)")
+
+    if leaked_count:
+        detail = (
+            f"{leaked_count} of {len(dst_days)} DST-transition trading days have "
+            "unexpected NONZERO bar activity on their own label -- that label's "
+            "bounds sit entirely inside the weekend closure (US DST transitions "
+            "always fall on a Sunday), so activity there indicates a boundary-"
+            "computation problem specific to this transition, not a market event"
+        )
+    else:
+        detail = (
+            f"0 of {len(dst_days)} DST-transition trading days have any bar "
+            "activity on their own (market-closed) label -- confirms "
+            "trading_day_bounds' DST-adjusted span computation correctly "
+            "excludes real trading activity for every transition in range"
+        )
+
     return [
         Finding(
             "I-01",
-            "DST day bar count",
+            "DST day boundary leakage",
             "INFO",
             None,
-            len(deviated),
-            (
-                f"{len(deviated)} of {dst_day_count} DST-transition trading days in range "
-                "have a present-bar count deviating >40% from the day's own expected "
-                "duration -- time engine / resampler disagreement on a DST-affected day"
-            ),
-            tuple(deviated),
+            leaked_count,
+            detail,
+            tuple(leaked),
         )
     ]
