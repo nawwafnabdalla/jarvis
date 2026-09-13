@@ -154,7 +154,7 @@ Every Stage 0 run — including widenings and the EUR/USD comparison — writes 
 
 It computes conditional descriptive statistics about GBP/USD. It does not simulate trades, compute PnL, evaluate entries or exits, or rank anything by profitability. Its purpose is to give a human enough understanding of the market to generate hypotheses worth testing.
 
-**Data scope: 2007–2022 by default.** Vault years are reachable only through the separate coarse regime-check command (Part L.4), never through these reports. This is the resolution of PDLA-03.
+**Data scope: 2007–2022 at most; the initial report suite (R1, R2, R5) is restricted to 2007–2014 only, per AR-1 (Part 4 §Z.1).** AR-1 applies uniformly to all three initial reports — nothing in this Bible categorizes R2 as exempt from it, and this stage's own opening sentence above already treats "conditional" as describing Stage 2's output as a whole, not a term distinguishing one report from the others (D-067). 2015–2018 is deliberately withheld from this stage precisely so Stage 3+ development reports can show it as the segment "not seen during hypothesis generation," per AR-1's own mechanism — Stage 2 itself never reads it. Vault years are reachable only through the separate coarse regime-check command (Part L.4), never through these reports. This is the resolution of PDLA-03 (vault boundary) and AR-1 (hypothesis-generation contamination).
 
 ### G.1.2 The initial report suite
 
