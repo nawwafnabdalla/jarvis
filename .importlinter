@@ -81,13 +81,32 @@ forbidden_modules =
     jarvis.reporting
     jarvis.cli
 
-# Placeholder: no storage-access submodule exists under `bars` yet (`bars`
-# is still an empty skeleton per WP-000). `jarvis.bars.storage` names the
-# future Parquet/DuckDB access point; import-linter silently skips forbidden
-# targets that do not yet exist in the graph, so this contract is
-# vacuously KEPT today and starts enforcing the moment that submodule is
-# created. Update the target name here if a later work package names it
-# differently.
+# WP-017/D-066: this contract's target used to be `jarvis.bars.storage`, a
+# module that never existed -- the real Parquet/DuckDB access points that
+# were actually built are `jarvis.bars.store` (BAR_SCHEMA, bars_path,
+# read_bars, write_bars) and `jarvis.bars.resample` (which also reads tick
+# Parquet directly, via `jarvis.ingest.histdata_import.tick_path`, and
+# calls write_bars). Both are internal implementation submodules of `bars`
+# whose public surface is re-exported through `jarvis.bars.__init__` --
+# confirmed directly, not assumed, by reading both files. Import-linter
+# silently skips forbidden targets that don't exist in the graph, so this
+# contract was vacuously KEPT (passing by matching nothing) from before
+# Stage 0 finished until this fix.
+#
+# allow_indirect_imports = true is deliberate, not a loophole: the rule's
+# intent is "don't bypass bars's public interface and touch bars.store
+# directly," not "no module may ever transitively cause bars.store to be
+# imported." Without this flag, `jarvis.bars.__init__` re-exporting from
+# `jarvis.bars.store` (so callers can do `from jarvis.bars import
+# read_bars`, the SANCTIONED path) makes every legitimate consumer of
+# `jarvis.bars`'s public API count as an indirect chain into bars.store,
+# and the contract fails almost universally -- confirmed directly: with
+# this flag absent, `jarvis.qa.report -> jarvis.bars -> jarvis.bars.store`
+# (a legitimate, sanctioned `from jarvis.bars import read_bars`) was
+# flagged identically to `jarvis.cli.main -> jarvis.bars.store` (a real
+# bypass, direct `from jarvis.bars.store import read_bars`). With the flag,
+# only the direct-import case is caught, which is what "only bars and
+# vault may access data/ storage" actually means.
 [importlinter:contract:single-reader-rule]
 name = single-reader rule: only bars and vault may access data/ storage
 type = forbidden
@@ -112,7 +131,9 @@ source_modules =
     jarvis.reporting
     jarvis.cli
 forbidden_modules =
-    jarvis.bars.storage
+    jarvis.bars.store
+    jarvis.bars.resample
+allow_indirect_imports = true
 
 [importlinter:contract:ingest-restriction]
 name = single-reader: ingest cannot read bars
