@@ -4,6 +4,16 @@ human-readable report + Parquet findings sidecar.
 No dataset sealing here -- that is Stage 1B. run_checks only classifies
 and reports; it never raises on an ERROR finding (the CLI's exit code is
 the gate, per the WP's explicit "must not raise on ERROR findings" rule).
+
+SOURCE (WP-010 / D-059): tick-level checks read from `data/tick/` (the
+HistData-backed store), one month at a time, mirroring resample.py's own
+retarget. The Dukascopy fetch-log-based checks (E-04/W-06 missing hours,
+E-05 malformed blob, E-06 fetch log/filesystem disagreement) have no
+equivalent for a monthly-import store -- a month either has a tick
+Parquet file or it doesn't, and `resample_range` already raises on that
+as a hole. FetchLogChecksAccumulator itself is left in jarvis.qa.checks,
+dormant and untouched, per D-059's "leave working code that costs
+nothing sitting unused" -- it is simply no longer called from here.
 """
 
 import subprocess
@@ -14,21 +24,13 @@ from pathlib import Path
 import polars as pl
 
 from jarvis.bars import read_bars
-from jarvis.core.config import load_instruments
-from jarvis.core.errors import IntegrityError, UserError
+from jarvis.core.errors import UserError
 from jarvis.core.types import Nanos
-from jarvis.ingest.fetch_log import read_fetch_log
-from jarvis.ingest.parse import parse_bi5_arrays
-from jarvis.ingest.urls import NS_PER_HOUR, raw_blob_path
+from jarvis.ingest.histdata_import import tick_path
 from jarvis.sessions import load_session_set_def
+from jarvis.timeengine import NS_PER_HOUR
 
-from jarvis.qa.checks import (
-    Finding,
-    FetchLogChecksAccumulator,
-    Severity,
-    TickChecksAccumulator,
-    bar_level_checks,
-)
+from jarvis.qa.checks import Finding, Severity, TickChecksAccumulator, bar_level_checks
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +42,7 @@ class QAReport:
     errors: int
     warnings: int
     infos: int
-    hours_examined: int
+    months_examined: int
     ticks_examined: int
     bars_examined: int
     started_utc: str
@@ -57,9 +59,23 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _month_of(hour_utc_ns: Nanos) -> tuple[int, int]:
-    dt = datetime.fromtimestamp(hour_utc_ns // 1_000_000_000, tz=timezone.utc)
-    return dt.year, dt.month
+def _months_between(start_ns: Nanos, end_ns: Nanos) -> list[tuple[int, int]]:
+    """Every (year, month) whose Parquet file could hold a tick in
+    [start_ns, end_ns) -- end_ns is exclusive, so the last relevant
+    instant is end_ns - 1. Mirrors bars/resample.py's identical helper;
+    kept as a small local duplicate rather than a new shared import,
+    since neither module is meant to depend on the other."""
+    start_dt = datetime.fromtimestamp(start_ns // 1_000_000_000, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp((end_ns - 1) // 1_000_000_000, tz=timezone.utc)
+    months: list[tuple[int, int]] = []
+    y, m = start_dt.year, start_dt.month
+    while (y, m) <= (end_dt.year, end_dt.month):
+        months.append((y, m))
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return months
 
 
 def run_checks(
@@ -79,9 +95,13 @@ def run_checks(
     resolves the id to a range and calls this function; that wrapper is
     out of scope for this package.
 
-    Re-parses every raw blob in range via parse_bi5_arrays, one hour of
-    ticks in memory at a time (same discipline as WP-005's resampler),
-    accumulating only counters and small sample lists across hours.
+    WP-010: reads ticks from data/tick/, one month's Parquet file in
+    memory at a time (mirroring resample.py's own retarget), accumulating
+    only counters and small sample lists across months. A month with no
+    tick Parquet file at all contributes nothing to the tick-level
+    checks -- it is not an error here; resample_range is the function
+    that raises on a missing month (a hole), and this function does not
+    duplicate that gate.
     """
     if start_ns % NS_PER_HOUR != 0 or end_ns % NS_PER_HOUR != 0:
         raise UserError(
@@ -94,42 +114,34 @@ def run_checks(
 
     session_set_def = load_session_set_def(session_set_id, session_set_version)
     thin_day_threshold = session_set_def.thin_day_threshold
-    point_scale = load_instruments()[instrument].point_scale
 
     tick_acc = TickChecksAccumulator()
-    fetch_acc = FetchLogChecksAccumulator()
-    month_log_cache: dict[tuple[int, int], dict] = {}
 
-    hours_examined = 0
+    months = _months_between(start_ns, end_ns)
+    months_examined = len(months)
     ticks_examined = 0
 
-    for raw_hour in range(start_ns, end_ns, NS_PER_HOUR):
-        hour_ns = Nanos(raw_hour)
-        hours_examined += 1
+    for year, month in months:
+        path = tick_path(repo_root, instrument, year, month)
+        if not path.is_file():
+            continue
 
-        path = raw_blob_path(repo_root, instrument, hour_ns)
-        blob_exists = path.is_file()
-        blob_size = path.stat().st_size if blob_exists else 0
+        df = pl.read_parquet(path)
+        df = df.filter((pl.col("ts_utc_ns") >= start_ns) & (pl.col("ts_utc_ns") < end_ns))
+        if df.height == 0:
+            continue
 
-        month_key = _month_of(hour_ns)
-        if month_key not in month_log_cache:
-            month_log_cache[month_key] = read_fetch_log(repo_root, instrument, *month_key)
-        log_entry = month_log_cache[month_key].get(hour_ns)
+        ticks_examined += df.height
+        tick_acc.add_batch(
+            df["ts_utc_ns"].to_numpy(),
+            df["bid"].to_numpy(),
+            df["ask"].to_numpy(),
+            df["bid_volume"].fill_null(0.0).to_numpy(),
+            df["ask_volume"].fill_null(0.0).to_numpy(),
+            f"{year:04d}-{month:02d}",
+        )
 
-        fetch_acc.observe_hour(hour_ns, blob_exists, blob_size, log_entry)
-
-        if blob_exists and blob_size > 0:
-            try:
-                ticks = parse_bi5_arrays(path, instrument, hour_ns, point_scale)
-            except IntegrityError as exc:
-                fetch_acc.record_malformed(hour_ns, str(exc))
-                continue
-            ticks_examined += ticks.record_count
-            tick_acc.add_hour(ticks, hour_ns)
-
-    findings: list[Finding] = []
-    findings.extend(tick_acc.finalize())
-    findings.extend(fetch_acc.finalize())
+    findings: list[Finding] = list(tick_acc.finalize())
 
     bars_df = read_bars(repo_root, instrument, start_ns, end_ns)
     bars_examined = bars_df.height
@@ -149,7 +161,7 @@ def run_checks(
         errors=errors,
         warnings=warnings,
         infos=infos,
-        hours_examined=hours_examined,
+        months_examined=months_examined,
         ticks_examined=ticks_examined,
         bars_examined=bars_examined,
         started_utc=started_utc,
@@ -205,7 +217,7 @@ def _render_markdown(report: QAReport, code_sha: str, generated: datetime) -> st
     lines.append(f"- Range: {_range_label(report.range_start_ns)} - {_range_label(report.range_end_ns)} (UTC, half-open)")
     lines.append(f"- ERROR: {report.errors}  WARNING: {report.warnings}  INFO: {report.infos}")
     lines.append(f"- Sealable: {report.sealable}")
-    lines.append(f"- Hours examined: {report.hours_examined}")
+    lines.append(f"- Months examined: {report.months_examined}")
     lines.append(f"- Ticks examined: {report.ticks_examined}")
     lines.append(f"- Bars examined: {report.bars_examined}")
     lines.append(f"- Code SHA: {code_sha}")

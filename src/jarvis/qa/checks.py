@@ -14,7 +14,6 @@ import polars as pl
 
 from jarvis.core.types import Nanos
 from jarvis.ingest.fetch_log import FetchLogEntry
-from jarvis.ingest.parse import TickArrays
 from jarvis.timeengine import (
     NS_PER_MINUTE,
     from_utc_ns,
@@ -65,10 +64,10 @@ def _append_sample(target: list[str], indices, formatter) -> None:
 
 
 class TickChecksAccumulator:
-    """Accumulates tick-level check state hour by hour. Holds only scalar
+    """Accumulates tick-level check state batch by batch (WP-010: one
+    data/tick/ month at a time, not one Dukascopy hour). Holds only scalar
     counters and small sample lists -- never raw tick arrays -- so the
-    caller's "one hour of ticks in memory at a time" discipline (WP-005)
-    is preserved here too."""
+    caller's "bounded memory per batch" discipline is preserved here too."""
 
     def __init__(self) -> None:
         self.e01_negative = 0
@@ -87,19 +86,26 @@ class TickChecksAccumulator:
         self.i02_count = 0
         self.i02_sample: list[str] = []
 
-    def add_hour(self, ticks: TickArrays, hour_ns: Nanos) -> None:
-        n = len(ticks.ts_utc_ns)
+    def add_batch(
+        self,
+        ts: np.ndarray,
+        bid: np.ndarray,
+        ask: np.ndarray,
+        bid_volume: np.ndarray,
+        ask_volume: np.ndarray,
+        label: str,
+    ) -> None:
+        n = len(ts)
         if n == 0:
             return
-        ts, bid, ask = ticks.ts_utc_ns, ticks.bid, ticks.ask
 
         self._check_spread(ts, bid, ask)
         self._check_price(ts, bid, ask)
         self._check_reversal(ts)
         self._check_duplicate(ts, bid, ask)
         self._check_jump(ts, bid, ask)
-        self._check_weekend(hour_ns, ts)
-        self._check_zero_volume(hour_ns, ticks.bid_volume, ticks.ask_volume)
+        self._check_weekend(ts)
+        self._check_zero_volume(label, bid_volume, ask_volume)
 
     # E-01 -------------------------------------------------------------
     def _check_spread(self, ts: np.ndarray, bid: np.ndarray, ask: np.ndarray) -> None:
@@ -196,16 +202,31 @@ class TickChecksAccumulator:
         )
 
     # W-03 -------------------------------------------------------------
-    def _check_weekend(self, hour_ns: Nanos, ts: np.ndarray) -> None:
+    def _check_weekend(self, ts: np.ndarray) -> None:
         """Weekend activity, Fri 17:05 NY - Sun 16:55 NY: a 5-minute buffer
         on top of timeengine.is_weekend_gap's exact 17:00 boundaries, so
         genuine boundary-adjacent activity is not flagged. The boundary
         itself is never reimplemented here -- the buffer is applied only
-        by comparing is_weekend_gap at ts and at ts +/- 5 minutes."""
-        if not _hour_may_touch_weekend(hour_ns):
+        by comparing is_weekend_gap at ts and at ts +/- 5 minutes.
+
+        Cheap, fully vectorised UTC-only pre-filter (Sat/Sun UTC, or
+        Friday >=20:00 UTC) narrows the candidate set before paying
+        is_weekend_gap's per-tick zoneinfo cost -- deliberately generous
+        (covers both EST -5 and EDT -4) so it can only over-include, never
+        under-include, ticks that need the real check. WP-010: replaces
+        the old per-hour _hour_may_touch_weekend filter now that this runs
+        per data/tick/ month rather than per Dukascopy hour -- same
+        principle, computed directly on the tick array instead."""
+        if len(ts) == 0:
             return
+        dt_col = pl.from_epoch(pl.Series("ts", ts), time_unit="ns")
+        weekday = dt_col.dt.weekday().to_numpy()  # Mon=1 .. Sun=7 (UTC)
+        hour = dt_col.dt.hour().to_numpy()
+        candidate_mask = (weekday >= 6) | ((weekday == 5) & (hour >= 20))
+        candidate_idx = np.nonzero(candidate_mask)[0]
+
         flagged_idx = []
-        for i in range(len(ts)):
+        for i in candidate_idx:
             t = int(ts[i])
             if (
                 is_weekend_gap(Nanos(t))
@@ -220,11 +241,16 @@ class TickChecksAccumulator:
 
     # I-02 -------------------------------------------------------------
     def _check_zero_volume(
-        self, hour_ns: Nanos, bid_volume: np.ndarray, ask_volume: np.ndarray
+        self, label: str, bid_volume: np.ndarray, ask_volume: np.ndarray
     ) -> None:
+        """HistData ticks (WP-010's source) carry no real volume field at
+        all -- every value is null, filled to 0.0 by the caller -- so this
+        will now fire for every batch examined. That is correct, not a
+        regression: it is a true, if unsurprising, fact about the data,
+        and stays INFO severity so it never affects sealability."""
         if np.all(bid_volume == 0.0) and np.all(ask_volume == 0.0):
             self.i02_count += 1
-            _append_sample(self.i02_sample, [0], lambda _i: f"{_iso(int(hour_ns))}")
+            _append_sample(self.i02_sample, [0], lambda _i: label)
 
     def finalize(self) -> list[Finding]:
         findings: list[Finding] = []
@@ -316,28 +342,11 @@ class TickChecksAccumulator:
                     "INFO",
                     None,
                     self.i02_count,
-                    f"{self.i02_count} hours reporting 0.0 for both bid and ask volume",
+                    f"{self.i02_count} batches reporting 0.0 for both bid and ask volume",
                     tuple(self.i02_sample),
                 )
             )
         return findings
-
-
-def _hour_may_touch_weekend(hour_ns: Nanos) -> bool:
-    """Cheap UTC-only pre-filter to skip is_weekend_gap's per-tick zoneinfo
-    cost for the large majority of hours that are obviously nowhere near
-    the weekend gap. Deliberately generous (covers both EST -5 and EDT -4)
-    so it can only over-include, never under-include, hours that need the
-    real per-tick check. Not a reimplementation of the boundary itself --
-    is_weekend_gap is still the sole source of truth for any hour that
-    passes this filter."""
-    dt = datetime.fromtimestamp(hour_ns // 1_000_000_000, tz=timezone.utc)
-    weekday = dt.isoweekday()  # Mon=1 .. Sun=7
-    if weekday in (6, 7):  # Sat, Sun UTC
-        return True
-    if weekday == 5 and dt.hour >= 20:  # Friday evening UTC
-        return True
-    return False
 
 
 # ---------------------------------------------------------------------------

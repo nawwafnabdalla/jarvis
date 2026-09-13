@@ -1,5 +1,4 @@
 from datetime import date, datetime, timezone
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -8,7 +7,6 @@ import pytest
 from jarvis.bars import BAR_SCHEMA
 from jarvis.core.types import Nanos
 from jarvis.ingest.fetch_log import FetchLogEntry
-from jarvis.ingest.parse import TickArrays
 from jarvis.qa.checks import (
     FetchLogChecksAccumulator,
     TickChecksAccumulator,
@@ -24,24 +22,27 @@ def _ns(y: int, mo: int, d: int, h: int = 0, mi: int = 0) -> Nanos:
     return Nanos(int(datetime(y, mo, d, h, mi, tzinfo=timezone.utc).timestamp()) * 1_000_000_000)
 
 
-def _ticks(
+def _add(
+    acc: TickChecksAccumulator,
     ts: list[int],
     bid: list[float],
     ask: list[float],
     bid_vol: list[float] | None = None,
     ask_vol: list[float] | None = None,
-) -> TickArrays:
+    label: str = "2024-01",
+) -> None:
+    """WP-010: TickChecksAccumulator.add_batch takes plain arrays plus a
+    batch label (a "YYYY-MM" data/tick/ month, in real use) instead of the
+    old TickArrays + hour_ns pair -- this test suite runs entirely against
+    synthetic arrays, never real TickArrays, so the label is arbitrary."""
     n = len(ts)
-    return TickArrays(
-        instrument="GBPUSD",
-        hour_utc_ns=Nanos(0),
-        ts_utc_ns=np.array(ts, dtype=np.int64),
-        bid=np.array(bid, dtype=np.float64),
-        ask=np.array(ask, dtype=np.float64),
-        bid_volume=np.array(bid_vol if bid_vol is not None else [1.0] * n, dtype=np.float64),
-        ask_volume=np.array(ask_vol if ask_vol is not None else [1.0] * n, dtype=np.float64),
-        record_count=n,
-        source_path=Path("dummy.bi5"),
+    acc.add_batch(
+        np.array(ts, dtype=np.int64),
+        np.array(bid, dtype=np.float64),
+        np.array(ask, dtype=np.float64),
+        np.array(bid_vol if bid_vol is not None else [1.0] * n, dtype=np.float64),
+        np.array(ask_vol if ask_vol is not None else [1.0] * n, dtype=np.float64),
+        label,
     )
 
 
@@ -53,13 +54,13 @@ def _find(findings, check_id: str):
 
 
 def test_e01_reports_negative_and_zero_spread_separately():
-    ticks = _ticks(
+    acc = TickChecksAccumulator()
+    _add(
+        acc,
         ts=[0, 1000, 2000, 3000],
         bid=[1.0, 1.0005, 1.0, 1.0],
         ask=[1.0001, 1.0000, 1.0, 1.0002],  # idx1: ask<bid (negative); idx2: ask==bid (zero)
     )
-    acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
     finding = _find(acc.finalize(), "E-01")
     assert finding is not None
     assert finding.severity == "ERROR"
@@ -69,9 +70,8 @@ def test_e01_reports_negative_and_zero_spread_separately():
 
 
 def test_e01_no_finding_when_spread_always_positive():
-    ticks = _ticks(ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     assert _find(acc.finalize(), "E-01") is None
 
 
@@ -79,9 +79,8 @@ def test_e01_no_finding_when_spread_always_positive():
 
 
 def test_e02_non_positive_price_detected():
-    ticks = _ticks(ts=[0, 1000], bid=[1.0, -0.5], ask=[1.0002, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[0, 1000], bid=[1.0, -0.5], ask=[1.0002, 1.0003])
     finding = _find(acc.finalize(), "E-02")
     assert finding is not None
     assert finding.severity == "ERROR"
@@ -89,9 +88,8 @@ def test_e02_non_positive_price_detected():
 
 
 def test_e02_no_finding_when_prices_positive():
-    ticks = _ticks(ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     assert _find(acc.finalize(), "E-02") is None
 
 
@@ -99,9 +97,8 @@ def test_e02_no_finding_when_prices_positive():
 
 
 def test_e03_reversal_detected():
-    ticks = _ticks(ts=[100, 200, 150], bid=[1.0, 1.0, 1.0], ask=[1.0001, 1.0001, 1.0001])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[100, 200, 150], bid=[1.0, 1.0, 1.0], ask=[1.0001, 1.0001, 1.0001])
     finding = _find(acc.finalize(), "E-03")
     assert finding is not None
     assert finding.severity == "ERROR"
@@ -111,9 +108,8 @@ def test_e03_reversal_detected():
 def test_e03_equal_consecutive_timestamps_not_flagged():
     """Acceptance criterion 3: two ticks sharing a millisecond is not a
     reversal -- only a strict decrease is."""
-    ticks = _ticks(ts=[100, 100, 200], bid=[1.0, 1.0, 1.0], ask=[1.0001, 1.0001, 1.0001])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[100, 100, 200], bid=[1.0, 1.0, 1.0], ask=[1.0001, 1.0001, 1.0001])
     assert _find(acc.finalize(), "E-03") is None
 
 
@@ -121,9 +117,8 @@ def test_e03_equal_consecutive_timestamps_not_flagged():
 
 
 def test_w01_duplicate_tick_detected():
-    ticks = _ticks(ts=[100, 100, 200], bid=[1.0, 1.0, 1.0002], ask=[1.0001, 1.0001, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[100, 100, 200], bid=[1.0, 1.0, 1.0002], ask=[1.0001, 1.0001, 1.0003])
     finding = _find(acc.finalize(), "W-01")
     assert finding is not None
     assert finding.severity == "WARNING"
@@ -131,16 +126,15 @@ def test_w01_duplicate_tick_detected():
 
 
 def test_w01_no_finding_when_ticks_differ():
-    ticks = _ticks(ts=[100, 200], bid=[1.0, 1.0002], ask=[1.0001, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=[100, 200], bid=[1.0, 1.0002], ask=[1.0001, 1.0003])
     assert _find(acc.finalize(), "W-01") is None
 
 
 # W-02 -------------------------------------------------------------------
 
 
-def _jump_ticks(n_stable: int, jump_size: float) -> TickArrays:
+def _jump_ticks(n_stable: int, jump_size: float) -> tuple[list[int], list[float], list[float]]:
     rng = np.random.default_rng(7)
     ts = np.arange(n_stable + 2, dtype=np.int64) * 1_000_000  # 1ms apart
     mid = 1.10000 + np.cumsum(rng.uniform(-1e-5, 1e-5, size=n_stable + 1))
@@ -149,13 +143,13 @@ def _jump_ticks(n_stable: int, jump_size: float) -> TickArrays:
         mid[-1] = mid[-2] + jump_size
     bid = mid - 0.00005
     ask = mid + 0.00005
-    return _ticks(ts=ts.tolist(), bid=bid.tolist(), ask=ask.tolist())
+    return ts.tolist(), bid.tolist(), ask.tolist()
 
 
 def test_w02_unrealistic_jump_detected():
-    ticks = _jump_ticks(n_stable=1005, jump_size=0.05)  # far larger than the noise floor
+    ts, bid, ask = _jump_ticks(n_stable=1005, jump_size=0.05)  # far larger than the noise floor
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=ts, bid=bid, ask=ask)
     finding = _find(acc.finalize(), "W-02")
     assert finding is not None
     assert finding.severity == "WARNING"
@@ -163,9 +157,9 @@ def test_w02_unrealistic_jump_detected():
 
 
 def test_w02_no_finding_for_normal_moves():
-    ticks = _jump_ticks(n_stable=1005, jump_size=0.0)
+    ts, bid, ask = _jump_ticks(n_stable=1005, jump_size=0.0)
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(acc, ts=ts, bid=bid, ask=ask)
     assert _find(acc.finalize(), "W-02") is None
 
 
@@ -175,9 +169,8 @@ def test_w02_no_finding_for_normal_moves():
 def test_w03_weekend_activity_detected():
     # 2024-01-06 is a Saturday, comfortably mid-gap.
     hour_ns = _ns(2024, 1, 6, 12)
-    ticks = _ticks(ts=[hour_ns, hour_ns + NS_PER_MINUTE], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, hour_ns)
+    _add(acc, ts=[hour_ns, hour_ns + NS_PER_MINUTE], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     finding = _find(acc.finalize(), "W-03")
     assert finding is not None
     assert finding.severity == "WARNING"
@@ -187,9 +180,8 @@ def test_w03_weekend_activity_detected():
 def test_w03_no_finding_for_weekday_ticks():
     # 2024-01-09 is a Tuesday.
     hour_ns = _ns(2024, 1, 9, 12)
-    ticks = _ticks(ts=[hour_ns, hour_ns + NS_PER_MINUTE], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, hour_ns)
+    _add(acc, ts=[hour_ns, hour_ns + NS_PER_MINUTE], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
     assert _find(acc.finalize(), "W-03") is None
 
 
@@ -200,9 +192,8 @@ def test_w03_buffer_excludes_boundary_adjacent_activity():
     # inside the gap but within the 5-minute buffer.
     hour_ns = _ns(2024, 1, 5, 22)  # 2024-01-05 is a Friday
     boundary_adjacent = hour_ns + 2 * NS_PER_MINUTE
-    ticks = _ticks(ts=[boundary_adjacent], bid=[1.0], ask=[1.0002])
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, hour_ns)
+    _add(acc, ts=[boundary_adjacent], bid=[1.0], ask=[1.0002])
     assert _find(acc.finalize(), "W-03") is None
 
 
@@ -210,11 +201,15 @@ def test_w03_buffer_excludes_boundary_adjacent_activity():
 
 
 def test_i02_volume_all_zero_detected():
-    ticks = _ticks(
-        ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003], bid_vol=[0.0, 0.0], ask_vol=[0.0, 0.0]
-    )
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(
+        acc,
+        ts=[0, 1000],
+        bid=[1.0, 1.0001],
+        ask=[1.0002, 1.0003],
+        bid_vol=[0.0, 0.0],
+        ask_vol=[0.0, 0.0],
+    )
     finding = _find(acc.finalize(), "I-02")
     assert finding is not None
     assert finding.severity == "INFO"
@@ -222,11 +217,15 @@ def test_i02_volume_all_zero_detected():
 
 
 def test_i02_no_finding_when_volume_present():
-    ticks = _ticks(
-        ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003], bid_vol=[1.0, 0.0], ask_vol=[0.0, 0.0]
-    )
     acc = TickChecksAccumulator()
-    acc.add_hour(ticks, Nanos(0))
+    _add(
+        acc,
+        ts=[0, 1000],
+        bid=[1.0, 1.0001],
+        ask=[1.0002, 1.0003],
+        bid_vol=[1.0, 0.0],
+        ask_vol=[0.0, 0.0],
+    )
     assert _find(acc.finalize(), "I-02") is None
 
 

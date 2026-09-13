@@ -229,10 +229,12 @@ def data_resample(
     allow_incomplete: bool = typer.Option(
         False,
         "--allow-incomplete",
-        help="Proceed even if some hours in range have no raw blob (a hole).",
+        help="Proceed even if some months in range have no tick data on disk (a hole).",
     ),
 ) -> None:
-    """Resample raw GBP/USD ticks for the given UTC range into 1-minute bars."""
+    """Resample GBP/USD ticks from data/tick/ for the given UTC range into
+    1-minute bars (WP-010: retargeted from the Dukascopy raw-blob source
+    to the HistData-backed tick store; see D-059)."""
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
@@ -257,9 +259,9 @@ def data_resample(
         raise typer.Exit(code=exc.exit_code) from exc
 
     typer.echo()
-    typer.echo(f"  Hours with data    {report.hours_with_data}")
-    typer.echo(f"  Hours empty        {report.hours_empty}")
-    typer.echo(f"  Hours unfetched    {report.hours_unfetched}")
+    typer.echo(f"  Months with data   {report.months_with_data}")
+    typer.echo(f"  Months missing     {report.months_missing}")
+    typer.echo(f"  Ticks read         {report.ticks_read}")
     typer.echo(f"  Bars written       {report.bars_written}")
     typer.echo(f"  Minutes absent     {report.minutes_absent}")
     typer.echo(f"  Months written     {', '.join(report.months_written)}")

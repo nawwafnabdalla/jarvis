@@ -1,4 +1,5 @@
-"""Tick -> 1-minute bar resampler (WP-005 items 2 and 4).
+"""Tick -> 1-minute bar resampler (WP-005 items 2 and 4; retargeted to
+`data/tick/` by WP-010, superseding the original Dukascopy-blob source).
 
 The single most consequential rule in this module: a bar exists if and
 only if at least one tick falls in its minute. A minute with no ticks
@@ -6,11 +7,29 @@ produces NO ROW -- never zero-filled, never forward-filled, never
 interpolated. Get this wrong and quiet periods silently become
 flat-price periods, which looks like real data and is not.
 
-Hole detection (item 4) is why WP-004c (the fetch log) had to land first:
-the filesystem alone decides what gets resampled -- a 0-byte blob is a
-legitimate zero-bar hour (market closed), and no blob at all is a hole.
-The fetch log is consulted only to explain a hole in an error message; it
-never influences the resample decision itself.
+SOURCE (WP-010 / D-059): reads `data/tick/` -- the HistData-backed store
+built by `jarvis.ingest.histdata_import.write_ticks` and corrected by
+D-055 (timezone), D-055h/D-056 (column order), and D-058 (tick-collision
+dedup). The Dukascopy raw-.bi5-blob path this module used before WP-010
+is gone from here: D-059 established that Dukascopy is no longer needed
+for forward-testing (HistData's own weekly update cadence covers it), so
+there is no live consumer left requiring this module to read blobs. The
+Dukascopy fetcher and its own tests are untouched and left in the
+repository, dormant, per D-059 -- only this module's SOURCE changed.
+
+Unit of iteration is now a MONTH (one `data/tick/.../data.parquet` file),
+not an hour (one `.bi5` blob): HistData ticks are already consolidated
+per month, and a whole month's ticks (worst case ~1.3M rows, confirmed by
+WP-009's real full import) comfortably fits in memory at once -- the same
+per-month granularity `write_ticks` itself already uses. A month with no
+tick Parquet file on disk is a HOLE (never imported, or not yet); a
+present month simply contributing zero ticks in the requested sub-range
+is not -- these are genuinely different pieces of information and must
+not be conflated (see `resample_range`'s missing-months handling).
+
+Ticks sharing an identical `ts_utc_ns` are a real, expected possibility
+now (D-058's `row_sequence` tie-break) -- see `_resample_ticks_into` for
+exactly how bar open/close handle this.
 """
 
 from dataclasses import dataclass
@@ -20,12 +39,10 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from jarvis.core.config import load_instruments
 from jarvis.core.errors import IntegrityError, UserError
 from jarvis.core.types import Nanos
-from jarvis.ingest.fetch_log import read_fetch_log
-from jarvis.ingest.parse import TickArrays, parse_bi5_arrays
-from jarvis.ingest.urls import NS_PER_HOUR, raw_blob_path
+from jarvis.ingest.histdata_import import tick_path
+from jarvis.timeengine import NS_PER_HOUR
 
 from jarvis.bars.store import BAR_SCHEMA, write_bars
 
@@ -39,11 +56,11 @@ class ResampleReport:
     instrument: str
     range_start_ns: Nanos
     range_end_ns: Nanos
-    hours_expected: int
-    hours_with_data: int
-    hours_empty: int  # 0-byte blob: market closed, legitimately no bars
-    hours_unfetched: int  # no blob at all: a HOLE
-    unfetched_hours: tuple[Nanos, ...]
+    months_expected: int
+    months_with_data: int
+    months_missing: int  # no tick Parquet file at all: a HOLE
+    missing_months: tuple[str, ...]  # "YYYY-MM" labels
+    ticks_read: int
     bars_written: int
     minutes_absent: int  # minutes in range with no bar (informational)
     months_written: tuple[str, ...]
@@ -61,25 +78,21 @@ def _iso(ns: Nanos) -> str:
     )
 
 
-def _month_of(hour_utc_ns: Nanos) -> tuple[int, int]:
-    dt = datetime.fromtimestamp(hour_utc_ns // 1_000_000_000, tz=timezone.utc)
-    return dt.year, dt.month
-
-
-def _hole_reasons(repo_root: Path, instrument: str, hours: list[Nanos]) -> list[str]:
-    """Best-effort explanation for the first few holes, drawn from the
-    fetch log -- informational only, per the module docstring. Never used
-    to decide what gets resampled."""
-    reasons = []
-    cache: dict[tuple[int, int], dict] = {}
-    for hour_ns in hours[:_HOLE_PREVIEW_LIMIT]:
-        key = _month_of(hour_ns)
-        if key not in cache:
-            cache[key] = read_fetch_log(repo_root, instrument, *key)
-        entry = cache[key].get(hour_ns)
-        reason = "never attempted" if entry is None else entry.status
-        reasons.append(f"{_iso(hour_ns)} ({reason})")
-    return reasons
+def _months_between(start_ns: Nanos, end_ns: Nanos) -> list[tuple[int, int]]:
+    """Every (year, month) whose Parquet file could hold a tick in
+    [start_ns, end_ns) -- end_ns is exclusive, so the last relevant
+    instant is end_ns - 1."""
+    start_dt = datetime.fromtimestamp(start_ns // 1_000_000_000, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp((end_ns - 1) // 1_000_000_000, tz=timezone.utc)
+    months: list[tuple[int, int]] = []
+    y, m = start_dt.year, start_dt.month
+    while (y, m) <= (end_dt.year, end_dt.month):
+        months.append((y, m))
+        m += 1
+        if m == 13:
+            m = 1
+            y += 1
+    return months
 
 
 def _new_accumulator() -> dict[str, list]:
@@ -150,19 +163,30 @@ def _append_bar(
     acc["prev_gap_ns"].append(prev_gap_ns)
 
 
-def _resample_hour_into(
-    acc: dict[str, list], ticks: TickArrays, prev_last_tick_ns: int | None
+def _resample_ticks_into(
+    acc: dict[str, list], ts: np.ndarray, bid: np.ndarray, ask: np.ndarray, prev_last_tick_ns: int | None
 ) -> int | None:
-    """Aggregate one hour's ticks into minute bars, appending into `acc`.
-    Ticks are assumed sorted by (ts_utc_ns, seq) -- ParsedHour/TickArrays's
-    documented invariant -- so their minute index is non-decreasing and
-    `np.unique` on it yields correctly-ordered run boundaries without an
-    explicit sort."""
-    n = len(ticks.ts_utc_ns)
+    """Aggregate a sorted run of ticks into minute bars, appending into
+    `acc`. Ticks are assumed sorted ascending by ts_utc_ns -- true of
+    `data/tick/`'s on-disk order (`write_ticks` sorts by
+    `(ts_utc_ns, row_sequence)`, D-058) -- so minute index is
+    non-decreasing and `np.unique` yields correctly-ordered run boundaries
+    without an explicit sort.
+
+    Two ticks sharing an identical ts_utc_ns (a real, expected case since
+    D-058 -- distinguished on disk only by row_sequence) land in the same
+    minute bucket and are handled correctly with no special-casing here:
+    `sub_bid[0]`/`sub_bid[-1]` (a bar's open/close) reflect FILE ORDER
+    among same-timestamp ticks, which IS row_sequence order, since the
+    frame was read off disk in that order and never re-sorted by this
+    function. This is the same tie-break principle the old Dukascopy path
+    relied on via Tick.seq -- see test_resample_preserves_same_millisecond_
+    ticks_in_row_sequence_order."""
+    n = len(ts)
     if n == 0:
         return prev_last_tick_ns
 
-    minute_idx = ticks.ts_utc_ns // NS_PER_MINUTE
+    minute_idx = ts // NS_PER_MINUTE
     unique_minutes, start_indices = np.unique(minute_idx, return_index=True)
     end_indices = np.append(start_indices[1:], n)
 
@@ -170,12 +194,12 @@ def _resample_hour_into(
         _append_bar(
             acc,
             minute_start_ns=int(minute) * NS_PER_MINUTE,
-            sub_ts=ticks.ts_utc_ns[start:end],
-            sub_bid=ticks.bid[start:end],
-            sub_ask=ticks.ask[start:end],
+            sub_ts=ts[start:end],
+            sub_bid=bid[start:end],
+            sub_ask=ask[start:end],
             prev_last_tick_ns=prev_last_tick_ns,
         )
-        prev_last_tick_ns = int(ticks.ts_utc_ns[end - 1])
+        prev_last_tick_ns = int(ts[end - 1])
 
     return prev_last_tick_ns
 
@@ -188,19 +212,25 @@ def resample_range(
     *,
     allow_incomplete: bool = False,
 ) -> ResampleReport:
-    """Resample every UTC hour in [start_ns, end_ns) to 1-minute bars.
+    """Resample every tick in [start_ns, end_ns) from `data/tick/` to
+    1-minute bars.
 
     start_ns and end_ns must both be hour-aligned; raises UserError
-    otherwise. Classifies every hour purely from the filesystem: a 0-byte
-    raw blob is a legitimate zero-bar hour (market closed); no blob at all
-    is a HOLE. By default (allow_incomplete=False) raises IntegrityError
-    if any hole exists in the range, rather than silently producing a
+    otherwise (kept as a general sanity bound, though the underlying
+    source is now month-granular). Classifies each covered month purely
+    from the filesystem: no `data/tick/.../data.parquet` file at all is a
+    HOLE. By default (allow_incomplete=False) raises IntegrityError if any
+    hole exists in the range, rather than silently producing a
     partial-looking result -- pass allow_incomplete=True to proceed
-    anyway (holes are then recorded in the report, not resampled).
+    anyway (holes are then recorded in the report, not resampled; no bars
+    file is written for a missing month, unlike a present-but-quiet one,
+    which still writes an explicit empty-schema file -- these are
+    deliberately not the same thing: one means "checked, nothing there",
+    the other means "never checked at all").
 
-    Processes hour by hour, holding at most one hour of ticks in memory at
-    a time, accumulating bars (not ticks) for the current month, and
-    writing+releasing on every month boundary."""
+    Processes month by month, holding at most one month of ticks in
+    memory at a time (data/tick/'s own storage granularity), writing and
+    releasing on every month boundary."""
     if start_ns % NS_PER_HOUR != 0 or end_ns % NS_PER_HOUR != 0:
         raise UserError(
             f"start_ns ({start_ns}) and end_ns ({end_ns}) must both be hour-aligned"
@@ -209,77 +239,60 @@ def resample_range(
         raise UserError(f"start_ns ({start_ns}) must be strictly before end_ns ({end_ns})")
 
     started_utc = _utc_now_iso()
-    point_scale = load_instruments()[instrument].point_scale
 
-    hours = [Nanos(ns) for ns in range(start_ns, end_ns, NS_PER_HOUR)]
+    months = _months_between(start_ns, end_ns)
 
-    hours_with_data = 0
-    hours_empty = 0
-    unfetched_hours: list[Nanos] = []
+    present_months: list[tuple[int, int]] = []
+    missing_months: list[tuple[int, int]] = []
+    for year, month in months:
+        if tick_path(repo_root, instrument, year, month).is_file():
+            present_months.append((year, month))
+        else:
+            missing_months.append((year, month))
 
-    classified: list[tuple[Nanos, str]] = []
-    for hour_ns in hours:
-        path = raw_blob_path(repo_root, instrument, hour_ns)
-        if not path.is_file():
-            unfetched_hours.append(hour_ns)
-            classified.append((hour_ns, "unfetched"))
-            continue
-        if path.stat().st_size == 0:
-            hours_empty += 1
-            classified.append((hour_ns, "empty"))
-            continue
-        hours_with_data += 1
-        classified.append((hour_ns, "data"))
-
-    if unfetched_hours and not allow_incomplete:
-        reasons = _hole_reasons(repo_root, instrument, unfetched_hours)
-        more = len(unfetched_hours) - len(reasons)
+    if missing_months and not allow_incomplete:
+        labels = [f"{y:04d}-{m:02d}" for y, m in missing_months]
+        preview = labels[:_HOLE_PREVIEW_LIMIT]
+        more = len(labels) - len(preview)
         suffix = f", and {more} more" if more > 0 else ""
         raise IntegrityError(
-            f"{len(unfetched_hours)} of {len(hours)} hours in "
-            f"[{_iso(start_ns)}, {_iso(end_ns)}) have no raw blob at all -- "
-            f"a HOLE, not a market-closed empty hour: {', '.join(reasons)}{suffix}. "
+            f"{len(missing_months)} of {len(months)} months in "
+            f"[{_iso(start_ns)}, {_iso(end_ns)}) have no tick data on disk at "
+            f"data/tick/ -- a HOLE, not an imported-and-empty month: "
+            f"{', '.join(preview)}{suffix}. "
             "Pass allow_incomplete=True to resample the rest anyway."
         )
 
     bars_written = 0
+    ticks_read = 0
     months_written: list[str] = []
     prev_last_tick_ns: int | None = None
-    current_month: tuple[int, int] | None = None
     acc = _new_accumulator()
 
-    def flush() -> None:
-        nonlocal bars_written, acc
-        if current_month is None:
-            return
-        # Written even when acc is empty (e.g. every hour in this month was
-        # a 0-byte market-closed blob): a schema-less empty frame would
-        # roundtrip through Parquet with no columns at all, and a later
-        # read_bars caller selecting e.g. bid_c would hit a column error on
-        # data that is perfectly valid -- zero bars is a legitimate result,
-        # not an absent one, and must carry BAR_SCHEMA's dtypes either way.
+    for year, month in present_months:
+        path = tick_path(repo_root, instrument, year, month)
+        df = pl.read_parquet(path)
+        df = df.filter((pl.col("ts_utc_ns") >= start_ns) & (pl.col("ts_utc_ns") < end_ns))
+        ticks_read += df.height
+
+        if df.height > 0:
+            ts = df["ts_utc_ns"].to_numpy()
+            bid = df["bid"].to_numpy()
+            ask = df["ask"].to_numpy()
+            prev_last_tick_ns = _resample_ticks_into(acc, ts, bid, ask, prev_last_tick_ns)
+
+        # Written even when acc is empty (e.g. the requested slice of this
+        # month has zero ticks): a schema-less empty frame would roundtrip
+        # through Parquet with no columns at all, and a later read_bars
+        # caller selecting e.g. bid_c would hit a column error on data
+        # that is perfectly valid -- zero bars is a legitimate result for
+        # a PRESENT month, not an absent one, and must carry BAR_SCHEMA's
+        # dtypes either way.
         frame = pl.DataFrame(acc, schema=BAR_SCHEMA)
-        write_bars(repo_root, instrument, current_month[0], current_month[1], frame)
+        write_bars(repo_root, instrument, year, month, frame)
         bars_written += len(acc["ts_utc_ns"])
-        months_written.append(f"{current_month[0]:04d}-{current_month[1]:02d}")
+        months_written.append(f"{year:04d}-{month:02d}")
         acc = _new_accumulator()
-
-    for hour_ns, kind in classified:
-        month = _month_of(hour_ns)
-        if current_month is None:
-            current_month = month
-        elif month != current_month:
-            flush()
-            current_month = month
-
-        if kind != "data":
-            continue
-
-        path = raw_blob_path(repo_root, instrument, hour_ns)
-        ticks = parse_bi5_arrays(path, instrument, hour_ns, point_scale)
-        prev_last_tick_ns = _resample_hour_into(acc, ticks, prev_last_tick_ns)
-
-    flush()
 
     completed_utc = _utc_now_iso()
     total_minutes = (end_ns - start_ns) // NS_PER_MINUTE
@@ -288,11 +301,11 @@ def resample_range(
         instrument=instrument,
         range_start_ns=start_ns,
         range_end_ns=end_ns,
-        hours_expected=len(hours),
-        hours_with_data=hours_with_data,
-        hours_empty=hours_empty,
-        hours_unfetched=len(unfetched_hours),
-        unfetched_hours=tuple(unfetched_hours),
+        months_expected=len(months),
+        months_with_data=len(present_months),
+        months_missing=len(missing_months),
+        missing_months=tuple(f"{y:04d}-{m:02d}" for y, m in missing_months),
+        ticks_read=ticks_read,
         bars_written=bars_written,
         minutes_absent=int(total_minutes - bars_written),
         months_written=tuple(months_written),
