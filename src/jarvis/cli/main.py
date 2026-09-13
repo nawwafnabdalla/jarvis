@@ -16,6 +16,8 @@ from jarvis.core.config import load_instruments, load_periods, repo_root
 from jarvis.core.errors import ConfigError, JarvisError, OutputError, UserError
 from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
+from jarvis.describe.periods import stage2_descriptive_range
+from jarvis.describe.r5 import compute_r5
 from jarvis.features import REGISTRY, compute, write_features
 from jarvis.ingest.fetch import ingest_range
 from jarvis.ingest.histdata_import import import_histdata
@@ -30,6 +32,7 @@ from jarvis.probe.report import (
 )
 from jarvis.probe.report import write_report as write_stage0_report
 from jarvis.qa.report import run_checks, write_report
+from jarvis.reporting.describe_r5 import write_r5_report
 from jarvis.sessions import load_session_set
 
 # Windows consoles commonly use a single-byte encoding (e.g. cp1252) that
@@ -174,7 +177,11 @@ app.add_typer(features_app, name="features")
 stage0_app = typer.Typer(name="stage0", help="Stage 0 feasibility probe.")
 app.add_typer(stage0_app, name="stage0")
 
+describe_app = typer.Typer(name="describe", help="Stage 2 market description reports.")
+app.add_typer(describe_app, name="describe")
+
 _INSTRUMENT = "GBPUSD"
+_IMPLEMENTED_REPORTS = ("R5",)
 
 
 def _parse_iso_utc_ns(value: str, *, option_name: str) -> Nanos:
@@ -563,3 +570,61 @@ def stage0_probe(
 
     if gate_result.decision not in ("PROCEED_GBPUSD", "PROCEED_GBPUSD_WITH_INSTABILITY_WARNING"):
         raise typer.Exit(code=3)
+
+
+@describe_app.command("run")
+def describe_run(
+    report: str = typer.Option(..., "--report", help="R1|R2|R5 (only R5 is implemented so far)"),
+    year: int = typer.Option(
+        None,
+        "--year",
+        help="Not yet supported -- R5 always covers the full fixed 2007-2014 range.",
+    ),
+) -> None:
+    """Run a Stage 2 market description report (Technical Bible Part 2
+    SS G.1). Every report in this suite computes over a fixed, non-
+    negotiable range -- 2007-2014 for R1/R2/R5, per AR-1 (D-067) -- so
+    unlike the Stage 1A pipeline commands, there is no --from/--to: the
+    range is not a parameter a caller can choose or forget.
+
+    --year is part of this command's documented signature
+    (Technical Bible Part 4 SS Q) but its intended behaviour for R5 is not
+    specified anywhere in the Bible -- refused with a clear error rather
+    than guessed at, per WP-019."""
+    try:
+        if year is not None:
+            raise UserError(
+                "--year is not yet supported: R5 always covers the full fixed "
+                "2007-2014 range, and no specification anywhere describes what "
+                "--year should do for it -- refused rather than guessed at"
+            )
+        if report not in _IMPLEMENTED_REPORTS:
+            raise UserError(
+                f"--report {report!r}: not yet implemented "
+                f"(implemented so far: {', '.join(_IMPLEMENTED_REPORTS)})"
+            )
+        root = repo_root()
+        start_ns, end_ns = stage2_descriptive_range()
+
+        typer.echo(f"Stage 2 describe run  {_INSTRUMENT}  --report {report}")
+
+        started = time.perf_counter()
+        bars = read_bars(root, _INSTRUMENT, start_ns, end_ns)
+        result = compute_r5(bars, start_ns=start_ns, end_ns=end_ns)
+        md_path, parquet_path = write_r5_report(root, result)
+        elapsed = time.perf_counter() - started
+
+        _echo_summary(
+            [
+                "",
+                f"  Bars examined      {result.bars_examined}",
+                f"  Hour-of-week rows  {len(result.by_hour_of_week)}",
+                f"  Year rows          {len(result.by_year)}",
+                f"  Report             {md_path}",
+                f"  Sidecar            {parquet_path}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        )
+    except JarvisError as exc:
+        typer.echo(f"jarvis describe run: {exc}")
+        raise typer.Exit(code=exc.exit_code) from exc

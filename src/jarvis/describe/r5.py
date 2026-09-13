@@ -37,16 +37,20 @@ _MIN_BOOTSTRAP_N = 10  # below this, no CI is attempted at all -- G.1.3's
 _BOOTSTRAP_SEED = 20260913  # fixed: reproducibility (Part 2 §F.1) applies
 # to this report the same way it applies to a feature's recomputation.
 
-# core.bootstrap's own default (2000) is sound for typical sample sizes,
-# but R5's year buckets are real, ~350,000-observation samples (confirmed
-# by running this against the actual 2007-2014 dataset) -- a percentile
-# bootstrap's cost scales with n_resamples * len(values) regardless of
-# memory-safe chunking, and 2000 resamples at that scale measured ~45s
-# PER bucket, ~8 minutes total across every hour-of-week and year bucket.
-# 500 resamples (still within the commonly-cited 500-2000 range for a
-# percentile-method 95% CI, and R5 is explicitly exploratory, not
-# confirmatory, per its own DESCRIPTIVE watermark) measured ~11s per
-# large bucket -- a disclosed precision/time trade-off, not a silent one.
+# WP-019/D-068b: 500, not core.bootstrap's own 2000 default, confirmed by
+# direct measurement against real R5 data, not inherited from the
+# pre-chunking memory workaround. Chunking (core/bootstrap.py) already
+# bounds peak memory the same way at 500 and 2000 alike (measured:
+# ~479MB either way on a real ~350,000-element bucket) -- so memory was
+# never the deciding factor once chunking existed. The actual question --
+# does 2000 move the CI bounds -- was tested on real cells (all 8 real
+# year buckets plus a range of real hour-of-week buckets, same seed,
+# both resample counts): bounds agreed to 3-4 significant figures
+# everywhere, several year buckets bit-identical. 2000 buys no measurable
+# precision on this data (large real samples, several genuinely quantized
+# to discrete pip values) while costing 4x the time (~11s vs ~45s per
+# large bucket, confirmed). 500 stays because the evidence shows it is
+# already stable, not because it merely "worked."
 _N_RESAMPLES = 500
 
 
