@@ -1,16 +1,19 @@
 # Stage 1A Operational Runbook — Resample → Validate → Features → Probe
 
-**WP-011. Spec only. Nothing in this document has been executed.** Every command
-below was verified against the actual current CLI source
+**WP-011. Originally spec-only; executed for real on 2026-09-13.** Every
+command below was verified against the actual current CLI source
 (`src/jarvis/cli/main.py`) and the actual current `probe`/`gate` source as of
-commit `3d6e850`, not assumed from memory of earlier work packages. This is a
-fresh document — the `STAGE_1A_RUNBOOK.md` referenced early in this project
-was written for the abandoned Dukascopy fetch-and-rate-limit pipeline and does
-not exist anywhere in this repo or its git history; nothing here is inherited
-from it.
+commit `3d6e850`, not assumed from memory of earlier work packages, at the
+time this document was written. This was a fresh document at the time — the
+`STAGE_1A_RUNBOOK.md` referenced early in this project was written for the
+abandoned Dukascopy fetch-and-rate-limit pipeline and did not exist anywhere
+in this repo or its git history; nothing here was inherited from it.
 
-Execution is a separate, later step, gated on this document being reviewed
-and approved.
+**Execution outcome:** all four steps ran against the real, corrected
+dataset (with two follow-up fixes along the way — WP-013/D-063, WP-014/D-064
+— and one CLI-output fix, WP-015/D-065). Stage 0 has now concluded for
+GBP/USD — see **D-024b** and **D-042** in `docs/DECISION_LOG.md`, and
+Section 6 below for the final execution record.
 
 ---
 
@@ -326,11 +329,13 @@ runbook discipline alone for the other three.
 
 ---
 
-## 7. What this document is not
+## 7. What this document originally was not (historical — see the top banner)
 
-This package wrote a specification. It did not run `jarvis data resample`,
-`jarvis data validate`, `jarvis features build`, or `jarvis stage0 probe`,
-and it produced no bars, no features, no QA report, no probe report, and no
-D-042 decision. Zero code was changed. Execution — including fixing Section
-0's blocking issue first — is a separate, later step, and happens only after
-this document has been reviewed and approved.
+**As originally written (WP-011), this package was a specification only:**
+it had not run `jarvis data resample`, `jarvis data validate`,
+`jarvis features build`, or `jarvis stage0 probe`, and had produced no bars,
+no features, no QA report, no probe report, and no D-042 decision. Zero code
+had been changed. This section is kept as a record of that starting point,
+not as a current statement — execution has since happened (2026-09-13,
+WP-013 through WP-016), D-042 is finalized, and Stage 0 has concluded for
+GBP/USD per D-024b.
