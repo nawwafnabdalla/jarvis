@@ -254,6 +254,34 @@ def test_write_report_produces_markdown_and_parquet(repo: Path):
     }
 
 
+def test_parquet_sidecar_holds_every_sample_markdown_caps_at_ten(repo: Path):
+    """WP-013: the exact gap that stopped the real Stage 1A investigation
+    from finding E-01's 11th occurrence in its own report -- the markdown
+    AND the Parquet sidecar both used to cap at 10 samples. Now: 15
+    zero-spread ticks (W-07) in one month must all be recoverable from the
+    Parquet sidecar, while the markdown shows only 10 plus an explicit
+    "and N more" note rather than silently stopping."""
+    hour = _hour_ns(2020, 1, 9, 3)
+    n = 15
+    records = [(Nanos(hour + i * 1_000_000_000), 1.30000, 1.30000, 1.0, 1.0) for i in range(n)]
+    _write_ticks(repo, "GBPUSD", 2020, 1, records)
+
+    report = run_checks(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
+    w07 = next(f for f in report.findings if f.check_id == "W-07")
+    assert w07.count == n
+    assert len(w07.sample) == n  # Finding itself already holds all 15
+
+    md_path, parquet_path = write_report(repo, report)
+
+    text = md_path.read_text(encoding="utf-8")
+    assert text.count("spread=0.000000") == 10  # markdown display cap
+    assert "and 5 more (see the Parquet sidecar for the complete list)" in text
+
+    findings_df = pl.read_parquet(parquet_path)
+    sidecar_sample = findings_df.filter(pl.col("check_id") == "W-07")["sample"][0]
+    assert len(sidecar_sample) == n  # sidecar holds all 15, uncapped
+
+
 def test_report_path_matches_naming_convention(repo: Path):
     hour = _hour_ns(2024, 1, 9, 3)
     _write_ticks(repo, "GBPUSD", 2024, 1, [(hour, 0.99900, 1.00000, 1.0, 1.0)])

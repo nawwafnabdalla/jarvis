@@ -209,6 +209,14 @@ def report_path(repo_root: Path, report: QAReport, generated: datetime) -> Path:
 
 _SEVERITY_ORDER: dict[Severity, int] = {"ERROR": 0, "WARNING": 1, "INFO": 2}
 
+# WP-013: the display cap belongs here, not in qa/checks.py's accumulation
+# step -- Finding.sample now holds every matching location (the Parquet
+# sidecar written below gets the full list, unmodified). This constant
+# controls only how many of those the human-readable markdown shows;
+# "concise markdown, complete sidecar" is the intent, not "sidecar as
+# truncated as markdown."
+_MARKDOWN_SAMPLE_DISPLAY_LIMIT = 10
+
 
 def _render_markdown(report: QAReport, code_sha: str, generated: datetime) -> str:
     lines: list[str] = []
@@ -242,9 +250,15 @@ def _render_markdown(report: QAReport, code_sha: str, generated: datetime) -> st
             lines.append(f"- Count: {finding.count}")
             lines.append(f"- {finding.detail}")
             if finding.sample:
+                shown = finding.sample[:_MARKDOWN_SAMPLE_DISPLAY_LIMIT]
+                omitted = len(finding.sample) - len(shown)
                 lines.append("- Samples:")
-                for s in finding.sample:
+                for s in shown:
                     lines.append(f"  - {s}")
+                if omitted > 0:
+                    lines.append(
+                        f"  - ... and {omitted} more (see the Parquet sidecar for the complete list)"
+                    )
             lines.append("")
 
     return "\n".join(lines)

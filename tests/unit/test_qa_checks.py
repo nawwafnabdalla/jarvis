@@ -50,10 +50,126 @@ def _find(findings, check_id: str):
     return next((f for f in findings if f.check_id == check_id), None)
 
 
+def _ns_ms(y: int, mo: int, d: int, h: int, mi: int, s: int, ms: int = 0) -> int:
+    base = int(datetime(y, mo, d, h, mi, s, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+    return base + ms * 1_000_000
+
+
+# WP-013: E-01/W-07 reconciliation, against the REAL historical row values ---
+#
+# These timestamps and bid/ask values are the actual rows found by WP-013's
+# full-archive scan of the real data/tick/ store (not fabricated) -- kept as
+# hermetic fixtures here rather than reading the live, gitignored,
+# machine-local store directly, same reasoning WP-010's tests already use.
+
+
+def test_real_20091113_zero_spread_cluster_is_w07_not_e01():
+    """D-055g already established these five rows (the only zero-spread
+    cluster in November 2009) as genuine, not corruption, at the ingest
+    layer. Before WP-013, qa/checks.py's own separate E-01 check still
+    flagged them as ERROR anyway -- this is the exact finding that halted
+    the real Stage 1A run at Step 2, and the runbook's own Section 5 had
+    (wrongly, before this fix) said they should not appear as E-01 at all."""
+    acc = TickChecksAccumulator()
+    _add(
+        acc,
+        ts=[
+            _ns_ms(2009, 11, 13, 20, 30, 8),
+            _ns_ms(2009, 11, 13, 20, 30, 26),
+            _ns_ms(2009, 11, 13, 20, 30, 27),
+            _ns_ms(2009, 11, 13, 20, 30, 30),
+            _ns_ms(2009, 11, 13, 20, 30, 31),
+        ],
+        bid=[1.669100, 1.668700, 1.668700, 1.668700, 1.668700],
+        ask=[1.669100, 1.668700, 1.668700, 1.668700, 1.668700],
+        label="2009-11",
+    )
+    findings = acc.finalize()
+    assert _find(findings, "E-01") is None
+    w07 = _find(findings, "W-07")
+    assert w07 is not None
+    assert w07.severity == "WARNING"
+    assert w07.count == 5
+
+
+def test_real_20160624_brexit_cluster_is_w07_not_e01():
+    """The five zero-spread ticks from 2016-06-24 10:14:56-57 UTC --
+    GBP/USD's Brexit-referendum-result crash. WP-013 confirmed directly
+    against the surrounding real ticks (not assumed): ~2x the day's
+    ordinary tick volume, ~8.6x the day's ordinary price range, and these
+    five rows themselves sit in a smoothly monotonic price decline
+    (1.379400 -> ... -> 1.379220) bracketed immediately by normal
+    non-zero spreads on both sides -- consistent with momentarily
+    evaporated two-sided liquidity during genuine extreme volatility, not
+    a decode defect."""
+    acc = TickChecksAccumulator()
+    _add(
+        acc,
+        ts=[
+            _ns_ms(2016, 6, 24, 10, 14, 56, 857),
+            _ns_ms(2016, 6, 24, 10, 14, 57, 123),
+            _ns_ms(2016, 6, 24, 10, 14, 57, 343),
+            _ns_ms(2016, 6, 24, 10, 14, 57, 577),
+            _ns_ms(2016, 6, 24, 10, 14, 57, 827),
+        ],
+        bid=[1.379400, 1.379330, 1.379280, 1.379240, 1.379220],
+        ask=[1.379400, 1.379330, 1.379280, 1.379240, 1.379220],
+        label="2016-06",
+    )
+    findings = acc.finalize()
+    assert _find(findings, "E-01") is None
+    w07 = _find(findings, "W-07")
+    assert w07 is not None
+    assert w07.severity == "WARNING"
+    assert w07.count == 5
+
+
+def test_finding_sample_is_not_capped_at_accumulation():
+    """WP-013: the old _SAMPLE_LIMIT=10 cap applied inside _append_sample
+    itself, so Finding.sample -- the thing both the markdown report AND
+    the Parquet sidecar are built from -- silently lost anything past the
+    10th match, for every check, forever. This is exactly why the real
+    Stage 1A run's E-01 finding (count=11) couldn't reveal where its
+    11th occurrence was: neither the markdown nor its Parquet sidecar
+    ever had it. The cap now lives only in qa/report.py's markdown
+    renderer; the accumulator (and therefore Finding.sample) must hold
+    every match."""
+    acc = TickChecksAccumulator()
+    n = 25
+    _add(
+        acc,
+        ts=list(range(0, n * 1000, 1000)),
+        bid=[1.0] * n,
+        ask=[1.0] * n,  # every row zero-spread -> W-07, n=25 matches
+    )
+    w07 = _find(acc.finalize(), "W-07")
+    assert w07 is not None
+    assert w07.count == 25
+    assert len(w07.sample) == 25  # not capped at 10
+
+
+def test_negative_spread_still_raises_e01_at_error_severity():
+    """WP-013 narrows E-01 to strictly-negative spread only -- it must NOT
+    also narrow it out of existence. A true inversion (ask < bid), which
+    the full-archive scan found precisely zero of anywhere in 2006-2022,
+    stays an ERROR if it is ever seen."""
+    acc = TickChecksAccumulator()
+    _add(acc, ts=[0], bid=[1.30010], ask=[1.30000])  # ask < bid
+    findings = acc.finalize()
+    e01 = _find(findings, "E-01")
+    assert e01 is not None
+    assert e01.severity == "ERROR"
+    assert e01.count == 1
+    assert _find(findings, "W-07") is None
+
+
 # E-01 -----------------------------------------------------------------
 
 
-def test_e01_reports_negative_and_zero_spread_separately():
+def test_e01_and_w07_reported_as_separate_findings():
+    """WP-013: negative spread (E-01, ERROR) and zero spread (W-07,
+    WARNING) are no longer one combined E-01 finding -- see D-063 for why
+    a real Stage 1A run made this split necessary."""
     acc = TickChecksAccumulator()
     _add(
         acc,
@@ -61,18 +177,27 @@ def test_e01_reports_negative_and_zero_spread_separately():
         bid=[1.0, 1.0005, 1.0, 1.0],
         ask=[1.0001, 1.0000, 1.0, 1.0002],  # idx1: ask<bid (negative); idx2: ask==bid (zero)
     )
-    finding = _find(acc.finalize(), "E-01")
-    assert finding is not None
-    assert finding.severity == "ERROR"
-    assert finding.count == 2
-    assert "1 strictly negative" in finding.detail
-    assert "1 exactly zero" in finding.detail
+    findings = acc.finalize()
+
+    e01 = _find(findings, "E-01")
+    assert e01 is not None
+    assert e01.severity == "ERROR"
+    assert e01.count == 1
+    assert "strictly negative" in e01.detail
+
+    w07 = _find(findings, "W-07")
+    assert w07 is not None
+    assert w07.severity == "WARNING"
+    assert w07.count == 1
+    assert "ask == bid" in w07.detail
 
 
 def test_e01_no_finding_when_spread_always_positive():
     acc = TickChecksAccumulator()
     _add(acc, ts=[0, 1000], bid=[1.0, 1.0001], ask=[1.0002, 1.0003])
-    assert _find(acc.finalize(), "E-01") is None
+    findings = acc.finalize()
+    assert _find(findings, "E-01") is None
+    assert _find(findings, "W-07") is None
 
 
 # E-02 -----------------------------------------------------------------

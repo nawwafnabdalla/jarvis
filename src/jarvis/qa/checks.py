@@ -24,7 +24,6 @@ from jarvis.timeengine import (
 
 Severity = Literal["ERROR", "WARNING", "INFO"]
 
-_SAMPLE_LIMIT = 10
 _JUMP_WINDOW = 1000  # W-02: trailing tick count for the rolling stdev
 _WEEKEND_BUFFER_NS = 5 * NS_PER_MINUTE  # W-03: buffer on is_weekend_gap's exact boundary
 _EXTREME_SPREAD_MULTIPLE = 20  # W-04
@@ -51,15 +50,20 @@ def _iso(ns: int) -> str:
 
 
 def _append_sample(target: list[str], indices, formatter) -> None:
-    remaining = _SAMPLE_LIMIT - len(target)
-    if remaining <= 0:
-        return
-    for idx in indices[:remaining]:
+    """Appends every matching index's formatted location, uncapped
+    (WP-013). Finding.sample is the complete record now -- the markdown
+    report is the one place a display cap belongs (qa/report.py's own
+    render step), not accumulation. A check with a very large count (e.g.
+    W-02's tens of thousands) simply produces a longer sample list; the
+    Parquet sidecar is the format meant to hold that, per D-013 (Markdown
+    plus Parquet/CSV sidecars) -- a sidecar that truncates the same way
+    the human-readable report does has no distinct purpose left."""
+    for idx in indices:
         target.append(formatter(int(idx)))
 
 
 # ---------------------------------------------------------------------------
-# Tick-level checks: E-01, E-02, E-03, W-01, W-02, W-03, I-02
+# Tick-level checks: E-01, E-02, E-03, W-01, W-02, W-03, W-07, I-02
 # ---------------------------------------------------------------------------
 
 
@@ -71,8 +75,9 @@ class TickChecksAccumulator:
 
     def __init__(self) -> None:
         self.e01_negative = 0
-        self.e01_zero = 0
         self.e01_sample: list[str] = []
+        self.w07_zero_spread = 0
+        self.w07_sample: list[str] = []
         self.e02_count = 0
         self.e02_sample: list[str] = []
         self.e03_count = 0
@@ -107,16 +112,27 @@ class TickChecksAccumulator:
         self._check_weekend(ts)
         self._check_zero_volume(label, bid_volume, ask_volume)
 
-    # E-01 -------------------------------------------------------------
+    # E-01 / W-07 --------------------------------------------------------
     def _check_spread(self, ts: np.ndarray, bid: np.ndarray, ask: np.ndarray) -> None:
+        """WP-013: a strictly negative spread (ask < bid, a true inversion)
+        and an exactly-zero spread (a locked quote) are no longer the same
+        finding at the same severity -- they were until a real Stage 1A run
+        surfaced a false positive this split fixes. See finalize()'s W-07
+        text for the full reasoning and the archive-wide measurement it
+        rests on; this function only needs to keep computing both masks
+        and routing each to its own accumulator, exactly as before."""
         spread = ask - bid
         neg_mask = spread < 0
         zero_mask = spread == 0
         self.e01_negative += int(neg_mask.sum())
-        self.e01_zero += int(zero_mask.sum())
-        bad_idx = np.nonzero(neg_mask | zero_mask)[0]
+        self.w07_zero_spread += int(zero_mask.sum())
+        neg_idx = np.nonzero(neg_mask)[0]
+        zero_idx = np.nonzero(zero_mask)[0]
         _append_sample(
-            self.e01_sample, bad_idx, lambda i: f"{_iso(int(ts[i]))} spread={spread[i]:.6f}"
+            self.e01_sample, neg_idx, lambda i: f"{_iso(int(ts[i]))} spread={spread[i]:.6f}"
+        )
+        _append_sample(
+            self.w07_sample, zero_idx, lambda i: f"{_iso(int(ts[i]))} spread={spread[i]:.6f}"
         )
 
     # E-02 -------------------------------------------------------------
@@ -254,21 +270,51 @@ class TickChecksAccumulator:
 
     def finalize(self) -> list[Finding]:
         findings: list[Finding] = []
-        total_bad = self.e01_negative + self.e01_zero
-        if total_bad:
+        if self.e01_negative:
             findings.append(
                 Finding(
                     check_id="E-01",
-                    check_name="Non-positive spread",
+                    check_name="Negative spread",
                     severity="ERROR",
                     year=None,
-                    count=total_bad,
+                    count=self.e01_negative,
                     detail=(
-                        f"{self.e01_negative} strictly negative (inverted quote, "
-                        f"likely a decode error), {self.e01_zero} exactly zero "
-                        "(likely a thin/stale quote)"
+                        f"{self.e01_negative} ticks with strictly negative spread "
+                        "(ask < bid) -- a true inversion, likely a decode error. "
+                        "Never observed anywhere in the full corrected 2006-2022 "
+                        "archive (WP-013's full-archive scan: 0 of 259,014,364 "
+                        "ticks) -- if this ever fires, that is new information, "
+                        "not a known/expected finding"
                     ),
                     sample=tuple(self.e01_sample),
+                )
+            )
+        if self.w07_zero_spread:
+            findings.append(
+                Finding(
+                    check_id="W-07",
+                    check_name="Zero-spread quote",
+                    severity="WARNING",
+                    year=None,
+                    count=self.w07_zero_spread,
+                    detail=(
+                        f"{self.w07_zero_spread} ticks with ask == bid (a locked "
+                        "quote). WP-013: reconciled with D-055g (which already "
+                        "established the 2009-11-13 case as genuine, not "
+                        "corruption, at the ingest layer) and measured directly "
+                        "against the full corrected archive -- 11 of 259,014,364 "
+                        "ticks (0.0000042%) across the whole 2006-2022 range, every "
+                        "single one investigated and traced to either D-055g's "
+                        "established case or the 2016-06-24 GBP/USD Brexit-"
+                        "referendum-result crash (confirmed directly against the "
+                        "surrounding ticks: ~2x ordinary tick volume, ~8.6x the "
+                        "day's ordinary price range, smoothly monotonic prices "
+                        "through the locked-quote ticks themselves, bracketed "
+                        "immediately by normal non-zero spreads). Not treated as "
+                        "corruption on that basis -- a strictly negative spread "
+                        "(E-01) still is"
+                    ),
+                    sample=tuple(self.w07_sample),
                 )
             )
         if self.e02_count:
@@ -392,25 +438,21 @@ class FetchLogChecksAccumulator:
             if not blob_exists:
                 self.year_missing[year] = self.year_missing.get(year, 0) + 1
                 lst = self.year_missing_sample.setdefault(year, [])
-                if len(lst) < _SAMPLE_LIMIT:
-                    lst.append(_iso(int(hour_ns)))
+                lst.append(_iso(int(hour_ns)))
 
         # E-06(a): log says fetched, filesystem disagrees.
         if log_entry is not None and log_entry.status == "fetched" and not blob_exists:
             self.e06_log_fetched_no_blob += 1
-            if len(self.e06_sample) < _SAMPLE_LIMIT:
-                self.e06_sample.append(f"{_iso(int(hour_ns))} log=fetched, no blob on disk")
+            self.e06_sample.append(f"{_iso(int(hour_ns))} log=fetched, no blob on disk")
 
         # E-06(b): non-empty blob with no matching log entry at all.
         if blob_exists and blob_size > 0 and log_entry is None:
             self.e06_blob_no_log_entry += 1
-            if len(self.e06_sample) < _SAMPLE_LIMIT:
-                self.e06_sample.append(f"{_iso(int(hour_ns))} non-empty blob, no log entry")
+            self.e06_sample.append(f"{_iso(int(hour_ns))} non-empty blob, no log entry")
 
     def record_malformed(self, hour_ns: Nanos, error: str) -> None:
         self.e05_count += 1
-        if len(self.e05_sample) < _SAMPLE_LIMIT:
-            self.e05_sample.append(f"{_iso(int(hour_ns))}: {error}")
+        self.e05_sample.append(f"{_iso(int(hour_ns))}: {error}")
 
     def finalize(self) -> list[Finding]:
         findings: list[Finding] = []
@@ -578,7 +620,7 @@ def _check_extreme_spread(
 
     findings: list[Finding] = []
     if flagged.height:
-        sample = tuple(_iso(int(v)) for v in flagged["ts_utc_ns"].to_list()[:_SAMPLE_LIMIT])
+        sample = tuple(_iso(int(v)) for v in flagged["ts_utc_ns"].to_list())
         findings.append(
             Finding(
                 "W-04",
@@ -598,7 +640,7 @@ def _check_extreme_spread(
         sample = tuple(
             f"weekday={row['_bucket_weekday']} hour={row['_bucket_hour']:02d} "
             f"({row['_bucket_count']} bars)"
-            for row in skipped.head(_SAMPLE_LIMIT).iter_rows(named=True)
+            for row in skipped.iter_rows(named=True)
         )
         findings.append(
             Finding(
@@ -643,18 +685,16 @@ def _check_thin_day(
     for i, d in enumerate(weekday_days):
         if i < _THIN_DAY_BASELINE:
             baseline_skipped += 1
-            if len(baseline_sample) < _SAMPLE_LIMIT:
-                baseline_sample.append(d.isoformat())
+            baseline_sample.append(d.isoformat())
             continue
         baseline_counts = [day_to_count[prior] for prior in weekday_days[i - _THIN_DAY_BASELINE : i]]
         median_count = float(np.median(baseline_counts))
         threshold = thin_day_threshold * median_count
         if day_to_count[d] < threshold:
             thin_count += 1
-            if len(thin_sample) < _SAMPLE_LIMIT:
-                thin_sample.append(
-                    f"{d.isoformat()} ({day_to_count[d]} bars < {threshold:.1f} threshold)"
-                )
+            thin_sample.append(
+                f"{d.isoformat()} ({day_to_count[d]} bars < {threshold:.1f} threshold)"
+            )
 
     findings: list[Finding] = []
     if thin_count:
@@ -714,10 +754,9 @@ def _check_dst_day(
         expected = duration_minutes
         actual = day_to_count.get(d, 0)
         if expected and abs(actual - expected) > _DST_DEVIATION_FRACTION * expected:
-            if len(deviated) < _SAMPLE_LIMIT:
-                deviated.append(
-                    f"{d.isoformat()} expected~{expected}min actual_bars={actual}"
-                )
+            deviated.append(
+                f"{d.isoformat()} expected~{expected}min actual_bars={actual}"
+            )
 
     if not deviated:
         return []
