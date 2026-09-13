@@ -14,7 +14,7 @@ import typer
 from jarvis.bars.resample import resample_range
 from jarvis.bars.store import read_bars
 from jarvis.core.config import load_instruments, load_periods, repo_root
-from jarvis.core.errors import ConfigError, JarvisError, UserError
+from jarvis.core.errors import ConfigError, JarvisError, OutputError, UserError
 from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.features import REGISTRY, compute, write_features
@@ -33,10 +33,36 @@ from jarvis.probe.report import write_report as write_stage0_report
 from jarvis.qa.report import run_checks, write_report
 from jarvis.sessions import load_session_set
 
+# Windows consoles commonly use a single-byte encoding (e.g. cp1252) that
+# cannot represent every codepoint a report may contain (e.g. U+2229 '∩' in
+# stage0's narrowest_intersection). Without this, printing such a value
+# raises an unhandled UnicodeEncodeError that bypasses the JarvisError
+# handling below entirely (WP-015/D-065). backslashreplace keeps the
+# terminal summary readable instead of crashing; the full report is always
+# also written to disk in its native UTF-8 encoding, unaffected by this.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(errors="backslashreplace")
+
 app = typer.Typer(name="jarvis")
 
 _EXPECTED_DIRS = ("config", "src", "tests", "data", "ledger")
 _DIRS_EXPECTED_MISSING = {"data": "WP-001", "ledger": "WP-00x"}
+
+
+def _echo_summary(lines: list[str]) -> None:
+    """Print a command's terminal summary. The underlying computation and
+    report-writing (if any) have already completed by the time this runs --
+    a failure here (e.g. an encoding error the reconfigure above didn't
+    catch) means only the summary itself failed to print, never that the
+    computation did. Raised as OutputError so callers get a documented exit
+    code (4) instead of an unhandled crash, regardless of what specifically
+    caused the failure (WP-015)."""
+    try:
+        for line in lines:
+            typer.echo(line)
+    except Exception as exc:
+        raise OutputError(f"failed to print command output: {exc}") from exc
 
 
 @app.callback(invoke_without_command=True)
@@ -63,75 +89,78 @@ def doctor() -> None:
     files load. Exit 0 if all present, 1 if any config fails to load."""
     try:
         root = repo_root()
-    except ConfigError as exc:
+
+        py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        py_impl = platform.python_implementation()
+        plat = platform.platform()
+
+        try:
+            tzdata_version = importlib.metadata.version("tzdata")
+        except importlib.metadata.PackageNotFoundError:
+            tzdata_version = "NOT INSTALLED"
+
+        lock_path = root / "requirements.lock"
+        if lock_path.is_file():
+            lock_hash = sha256_file(lock_path)
+            lock_name = lock_path.name
+        else:
+            lock_hash = "MISSING"
+            lock_name = "requirements.lock"
+
+        usage = shutil.disk_usage(root.anchor)
+        free_gb = usage.free / (1024**3)
+
+        dir_lines = []
+        for name in _EXPECTED_DIRS:
+            exists = (root / name).is_dir()
+            status = "OK" if exists else "MISSING"
+            if not exists and name in _DIRS_EXPECTED_MISSING:
+                status += f" (expected until {_DIRS_EXPECTED_MISSING[name]})"
+            dir_lines.append(f"{name} {status}")
+
+        config_ok = True
+        config_lines = []
+        try:
+            load_instruments()
+            config_lines.append("instruments.yaml OK (GBPUSD)")
+        except ConfigError as exc:
+            config_ok = False
+            config_lines.append(f"instruments.yaml FAILED ({exc})")
+
+        try:
+            periods = load_periods()
+            dev = periods["development"]
+            val = periods["validation"]
+            hold = periods["holdout"]
+            hold_end = hold[1] if hold[1] is not None else "present"
+            config_lines.append(
+                "periods.yaml OK "
+                f"(development {dev[0]}..{dev[1]}, "
+                f"validation {val[0]}..{val[1]}, "
+                f"holdout {hold[0]}..{hold_end})"
+            )
+        except ConfigError as exc:
+            config_ok = False
+            config_lines.append(f"periods.yaml FAILED ({exc})")
+
+        lines = [
+            "jarvis doctor",
+            f"  Python        {py_version}  ({py_impl}, {sys.platform})",
+            f"  Platform      {plat}",
+            f"  Repo root     {root}",
+            f"  tzdata        {tzdata_version}",
+            f"  Deps lock     {lock_hash}  ({lock_name})",
+            f"  Free disk     {free_gb:.1f} GB on {root.drive or root.anchor}",
+            f"  Directories   {'  '.join(dir_lines)}",
+            f"  Config        {config_lines[0]}",
+        ]
+        for line in config_lines[1:]:
+            lines.append(f"                {line}")
+        lines.append(f"  Status        {'OK' if config_ok else 'FAILED'}")
+        _echo_summary(lines)
+    except JarvisError as exc:
         typer.echo(f"jarvis doctor: {exc}")
-        raise typer.Exit(code=1) from exc
-
-    py_version = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-    py_impl = platform.python_implementation()
-    plat = platform.platform()
-
-    try:
-        tzdata_version = importlib.metadata.version("tzdata")
-    except importlib.metadata.PackageNotFoundError:
-        tzdata_version = "NOT INSTALLED"
-
-    lock_path = root / "requirements.lock"
-    if lock_path.is_file():
-        lock_hash = sha256_file(lock_path)
-        lock_name = lock_path.name
-    else:
-        lock_hash = "MISSING"
-        lock_name = "requirements.lock"
-
-    usage = shutil.disk_usage(root.anchor)
-    free_gb = usage.free / (1024**3)
-
-    dir_lines = []
-    for name in _EXPECTED_DIRS:
-        exists = (root / name).is_dir()
-        status = "OK" if exists else "MISSING"
-        if not exists and name in _DIRS_EXPECTED_MISSING:
-            status += f" (expected until {_DIRS_EXPECTED_MISSING[name]})"
-        dir_lines.append(f"{name} {status}")
-
-    config_ok = True
-    config_lines = []
-    try:
-        load_instruments()
-        config_lines.append("instruments.yaml OK (GBPUSD)")
-    except ConfigError as exc:
-        config_ok = False
-        config_lines.append(f"instruments.yaml FAILED ({exc})")
-
-    try:
-        periods = load_periods()
-        dev = periods["development"]
-        val = periods["validation"]
-        hold = periods["holdout"]
-        hold_end = hold[1] if hold[1] is not None else "present"
-        config_lines.append(
-            "periods.yaml OK "
-            f"(development {dev[0]}..{dev[1]}, "
-            f"validation {val[0]}..{val[1]}, "
-            f"holdout {hold[0]}..{hold_end})"
-        )
-    except ConfigError as exc:
-        config_ok = False
-        config_lines.append(f"periods.yaml FAILED ({exc})")
-
-    typer.echo("jarvis doctor")
-    typer.echo(f"  Python        {py_version}  ({py_impl}, {sys.platform})")
-    typer.echo(f"  Platform      {plat}")
-    typer.echo(f"  Repo root     {root}")
-    typer.echo(f"  tzdata        {tzdata_version}")
-    typer.echo(f"  Deps lock     {lock_hash}  ({lock_name})")
-    typer.echo(f"  Free disk     {free_gb:.1f} GB on {root.drive or root.anchor}")
-    typer.echo(f"  Directories   {'  '.join(dir_lines)}")
-    typer.echo(f"  Config        {config_lines[0]}")
-    for line in config_lines[1:]:
-        typer.echo(f"                {line}")
-    typer.echo(f"  Status        {'OK' if config_ok else 'FAILED'}")
+        raise typer.Exit(code=exc.exit_code) from exc
 
     if not config_ok:
         raise typer.Exit(code=1)
@@ -209,18 +238,22 @@ def data_fetch(
             timeout_seconds=timeout_seconds,
         )
         elapsed = time.perf_counter() - started
+
+        _echo_summary(
+            [
+                "",
+                f"  Fetched            {report.hours_fetched}",
+                f"  Empty (no data)    {report.hours_empty}",
+                f"  Skipped (existing) {report.hours_skipped_existing}",
+                f"  Missing            {report.hours_missing}",
+                f"  Rate limited       {report.hours_rate_limited}",
+                f"  Total bytes        {report.total_bytes:,}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        )
     except JarvisError as exc:
         typer.echo(f"jarvis data fetch: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    typer.echo(f"  Fetched            {report.hours_fetched}")
-    typer.echo(f"  Empty (no data)    {report.hours_empty}")
-    typer.echo(f"  Skipped (existing) {report.hours_skipped_existing}")
-    typer.echo(f"  Missing            {report.hours_missing}")
-    typer.echo(f"  Rate limited       {report.hours_rate_limited}")
-    typer.echo(f"  Total bytes        {report.total_bytes:,}")
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
 
 
 @data_app.command("resample")
@@ -256,18 +289,22 @@ def data_resample(
             allow_incomplete=allow_incomplete,
         )
         elapsed = time.perf_counter() - started
+
+        _echo_summary(
+            [
+                "",
+                f"  Months with data   {report.months_with_data}",
+                f"  Months missing     {report.months_missing}",
+                f"  Ticks read         {report.ticks_read}",
+                f"  Bars written       {report.bars_written}",
+                f"  Minutes absent     {report.minutes_absent}",
+                f"  Months written     {', '.join(report.months_written)}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        )
     except JarvisError as exc:
         typer.echo(f"jarvis data resample: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    typer.echo(f"  Months with data   {report.months_with_data}")
-    typer.echo(f"  Months missing     {report.months_missing}")
-    typer.echo(f"  Ticks read         {report.ticks_read}")
-    typer.echo(f"  Bars written       {report.bars_written}")
-    typer.echo(f"  Minutes absent     {report.minutes_absent}")
-    typer.echo(f"  Months written     {', '.join(report.months_written)}")
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
 
 
 @data_app.command("validate")
@@ -295,17 +332,21 @@ def data_validate(
         report = run_checks(root, _INSTRUMENT, start_ns, end_ns)
         elapsed = time.perf_counter() - started
         md_path, _parquet_path = write_report(root, report)
+
+        _echo_summary(
+            [
+                "",
+                f"  ERROR              {report.errors}",
+                f"  WARNING            {report.warnings}",
+                f"  INFO               {report.infos}",
+                f"  Sealable           {report.sealable}",
+                f"  Report             {md_path}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        )
     except JarvisError as exc:
         typer.echo(f"jarvis data validate: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    typer.echo(f"  ERROR              {report.errors}")
-    typer.echo(f"  WARNING            {report.warnings}")
-    typer.echo(f"  INFO               {report.infos}")
-    typer.echo(f"  Sealable           {report.sealable}")
-    typer.echo(f"  Report             {md_path}")
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
 
     if report.errors > 0:
         raise typer.Exit(code=3)
@@ -352,31 +393,32 @@ def data_import_histdata(
         started = time.perf_counter()
         report = import_histdata(root, source_path, _INSTRUMENT, start=start, end=end, force=force)
         elapsed = time.perf_counter() - started
+
+        lines = [""]
+        for key in sorted(report.stamp_clocks):
+            lines.append(
+                f"  {key}  stamp_clock={report.stamp_clocks[key]:<14} "
+                f"declared_gaps={report.gap_reports.get(key, 0)}"
+            )
+        lines.append("")
+        lines.append(f"  Months found       {report.months_found}")
+        lines.append(f"  Months imported    {report.months_imported}")
+        lines.append(f"  Months skipped     {len(report.months_skipped)}")
+        lines.append(f"  Total ticks        {report.total_ticks:,}")
+
+        clock_tally: dict[str, int] = {}
+        for clock in report.stamp_clocks.values():
+            clock_tally[clock] = clock_tally.get(clock, 0) + 1
+        lines.append(f"  Stamp clock tally  {dict(sorted(clock_tally.items()))}")
+
+        lines.append(f"  Elapsed            {_format_elapsed(elapsed)}")
+        if report.months_imported > 0:
+            per_month = elapsed / report.months_imported
+            lines.append(f"  Throughput         {per_month:.2f}s/month")
+        _echo_summary(lines)
     except JarvisError as exc:
         typer.echo(f"jarvis data import-histdata: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    for key in sorted(report.stamp_clocks):
-        typer.echo(
-            f"  {key}  stamp_clock={report.stamp_clocks[key]:<14} "
-            f"declared_gaps={report.gap_reports.get(key, 0)}"
-        )
-    typer.echo()
-    typer.echo(f"  Months found       {report.months_found}")
-    typer.echo(f"  Months imported    {report.months_imported}")
-    typer.echo(f"  Months skipped     {len(report.months_skipped)}")
-    typer.echo(f"  Total ticks        {report.total_ticks:,}")
-
-    clock_tally: dict[str, int] = {}
-    for clock in report.stamp_clocks.values():
-        clock_tally[clock] = clock_tally.get(clock, 0) + 1
-    typer.echo(f"  Stamp clock tally  {dict(sorted(clock_tally.items()))}")
-
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
-    if report.months_imported > 0:
-        per_month = elapsed / report.months_imported
-        typer.echo(f"  Throughput         {per_month:.2f}s/month")
 
 
 @features_app.command("build")
@@ -402,7 +444,7 @@ def features_build(
 
         bars_df = read_bars(root, _INSTRUMENT, start_ns, end_ns)
         if bars_df.height == 0:
-            typer.echo("No bars in range; nothing to compute.")
+            _echo_summary(["No bars in range; nothing to compute."])
             raise typer.Exit(code=0)
 
         session_set = load_session_set("fx_core", 1)
@@ -423,18 +465,21 @@ def features_build(
             write_features(root, _INSTRUMENT, year, month, month_frame.drop(["_dt", "_year", "_month"]))
             months_written.append(f"{year:04d}-{month:02d}")
         elapsed = time.perf_counter() - started
+
+        lines = [
+            "",
+            f"  Bars               {bars_df.height}",
+            f"  Feature set        v{result.feature_set_version}",
+            f"  Months written     {', '.join(months_written)}",
+            "  Null counts:",
+        ]
+        for name in result.feature_names:
+            lines.append(f"    {name:<24} {result.null_counts[name]}")
+        lines.append(f"  Elapsed            {_format_elapsed(elapsed)}")
+        _echo_summary(lines)
     except JarvisError as exc:
         typer.echo(f"jarvis features build: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    typer.echo(f"  Bars               {bars_df.height}")
-    typer.echo(f"  Feature set        v{result.feature_set_version}")
-    typer.echo(f"  Months written     {', '.join(months_written)}")
-    typer.echo("  Null counts:")
-    for name in result.feature_names:
-        typer.echo(f"    {name:<24} {result.null_counts[name]}")
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
 
 
 @stage0_app.command("probe")
@@ -452,7 +497,9 @@ def stage0_probe(
     range touching 2023-01-01 or later -- the vault is untouched, even
     for Stage 0's own descriptive purposes (PDLA-03/D-021). Exit 0 on
     PROCEED_*, exit 3 on WIDEN_CONTEXT / CONSIDER_EURUSD_FALLBACK /
-    INSUFFICIENT_DATA."""
+    INSUFFICIENT_DATA, exit 4 if the gate computed and the report was
+    written but printing the terminal summary itself failed (check the
+    report file directly in that case; see OutputError, D-065)."""
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
@@ -499,17 +546,21 @@ def stage0_probe(
             events,
             prior_run_count=len(prior_runs),
         )
+
+        _echo_summary(
+            [
+                "",
+                f"  Decision           {gate_result.decision}",
+                f"  Median annual (M)  {gate_result.median_annual}",
+                f"  P10 annual         {gate_result.p10_annual}",
+                f"  Narrowest          {gate_result.narrowest_intersection}",
+                f"  Report             {md_path}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        )
     except JarvisError as exc:
         typer.echo(f"jarvis stage0 probe: {exc}")
         raise typer.Exit(code=exc.exit_code) from exc
-
-    typer.echo()
-    typer.echo(f"  Decision           {gate_result.decision}")
-    typer.echo(f"  Median annual (M)  {gate_result.median_annual}")
-    typer.echo(f"  P10 annual         {gate_result.p10_annual}")
-    typer.echo(f"  Narrowest          {gate_result.narrowest_intersection}")
-    typer.echo(f"  Report             {md_path}")
-    typer.echo(f"  Elapsed            {_format_elapsed(elapsed)}")
 
     if gate_result.decision not in ("PROCEED_GBPUSD", "PROCEED_GBPUSD_WITH_INSTABILITY_WARNING"):
         raise typer.Exit(code=3)

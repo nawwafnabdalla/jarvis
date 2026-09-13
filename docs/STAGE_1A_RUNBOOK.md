@@ -116,22 +116,22 @@ defect reappearing and must stop the run for investigation, not be read as
 the boundary "working as intended."
 
 Every date above is midnight UTC and therefore hour-aligned, satisfying
-`_parse_iso_utc_ns`'s alignment check (`src/jarvis/cli/main.py:151-162`),
+`_parse_iso_utc_ns`'s alignment check (`src/jarvis/cli/main.py:181-192`),
 which every one of these commands enforces identically.
 
 ---
 
 ## 3. Exact command sequence
 
-Verified directly against `src/jarvis/cli/main.py` (line numbers as of commit
-`3d6e850`). Run in this order:
+Verified directly against `src/jarvis/cli/main.py` (line numbers as of
+WP-015/D-065). Run in this order:
 
 ### Step 0 — Ingest (already complete; not run by this runbook)
 
 `data/tick/instrument=GBPUSD/` already contains all 196 months, 2006-09
 through 2022-12, per D-056/D-058. No action.
 
-### Step 1 — Resample (`data_resample`, `cli/main.py:225-268`)
+### Step 1 — Resample (`data_resample`, `cli/main.py:259-307`)
 
 ```bash
 jarvis data resample --from 2006-09-01T00:00:00Z --to 2023-01-01T00:00:00Z
@@ -145,7 +145,7 @@ to consciously accept a known hole, not to suppress an unexpected one.
 Expect the printed report to show `Months missing 0` and `Months with data
 196`.
 
-### Step 2 — Validate (`data_validate`, `cli/main.py:271-308`)
+### Step 2 — Validate (`data_validate`, `cli/main.py:310-352`)
 
 ```bash
 jarvis data validate --from 2006-09-01T00:00:00Z --to 2023-01-01T00:00:00Z
@@ -153,20 +153,24 @@ jarvis data validate --from 2006-09-01T00:00:00Z --to 2023-01-01T00:00:00Z
 
 Apply the QA-finding-severity rule in Section 4 to the result before
 proceeding to Step 3. Exit code 3 means at least one ERROR finding exists
-(`report.errors > 0`, `cli/main.py:307-308`) — per Section 4, that halts the
-run pending review, it does not mean "retry" or "ignore and continue."
+(`report.errors > 0`, `cli/main.py:351-352`) — per Section 4, that halts the
+run pending review, it does not mean "retry" or "ignore and continue." Exit
+code 4 means the QA computation completed and the report was already written
+to disk, but the CLI's own terminal summary failed to print (WP-015/D-065) —
+read the report file directly in that case rather than treating it as a
+computation failure.
 
-### Step 3 — Features (`features_build`, `cli/main.py:379-433`)
+### Step 3 — Features (`features_build`, `cli/main.py:424-482`)
 
 ```bash
 jarvis features build --from 2006-09-01T00:00:00Z --to 2023-01-01T00:00:00Z
 ```
 
 No `--features` flag — omitting it computes every registered feature
-(`tuple(REGISTRY)`, `cli/main.py:397`), which is what should be persisted to
+(`tuple(REGISTRY)`, `cli/main.py:443`), which is what should be persisted to
 `data/features/`.
 
-### Step 4 — Probe (`stage0_probe`, `cli/main.py:436-511`)
+### Step 4 — Probe (`stage0_probe`, `cli/main.py:485-566`)
 
 **Blocked on Section 0 being fixed first.** Once it is:
 
@@ -176,7 +180,7 @@ jarvis stage0 probe --from 2006-09-01T00:00:00Z --to 2023-01-01T00:00:00Z
 
 No `--widen`. This is the baseline run. `run_probe` refuses to widen a
 lineage more than once (`has_prior_widening`, enforced in
-`cli/main.py:469-475`) — if the baseline decision is `WIDEN_CONTEXT`, the
+`cli/main.py:519-526`) — if the baseline decision is `WIDEN_CONTEXT`, the
 single permitted follow-up is:
 
 ```bash
@@ -190,7 +194,21 @@ specified here.
 
 Exit code 3 on `WIDEN_CONTEXT`, `CONSIDER_EURUSD_FALLBACK`, or
 `INSUFFICIENT_DATA`; exit 0 on `PROCEED_GBPUSD` or
-`PROCEED_GBPUSD_WITH_INSTABILITY_WARNING` (`cli/main.py:510-511`).
+`PROCEED_GBPUSD_WITH_INSTABILITY_WARNING` (`cli/main.py:565-566`).
+
+**Exit code 4, added by WP-015/D-065 and observed on the first real
+execution of this step (2026-09-13):** the gate computed and the report was
+written to disk successfully, but the CLI's own terminal summary failed to
+print — on this project's first live run, `narrowest_intersection` (always
+one of the `∩`-bearing `INTERSECTION_KEYS`) could not be encoded by the
+Windows console's `cp1252` encoding, and the process exited 1 (an unhandled
+crash, matching neither 0 nor 3 documented above) rather than a documented
+code. This is now fixed — the CLI reconfigures its output streams to
+degrade gracefully instead of crashing, and any output-stage failure that
+still occurs surfaces as exit code 4, not an unhandled exception. On exit 4,
+the decision, median, P10, and narrowest intersection are NOT reliably known
+from the console output — read the written `.md` report directly instead;
+the run itself already completed correctly.
 
 ---
 

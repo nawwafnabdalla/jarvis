@@ -25,6 +25,14 @@ class GateNotMetError(JarvisError):
     exit_code = 3
 
 
+class OutputError(JarvisError):
+    """The underlying computation succeeded and its full result was already
+    written to disk; only the CLI's own terminal summary failed to print.
+    Never raised for a real data/computation failure."""
+
+    exit_code = 4
+
+
 class ConfigError(UserError):
     """Configuration is missing, malformed, or violates a frozen decision."""
 

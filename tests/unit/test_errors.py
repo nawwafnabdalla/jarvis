@@ -21,6 +21,7 @@ def test_all_errors_derive_from_jarvis_error():
         (errors.UserError, 1),
         (errors.IntegrityError, 2),
         (errors.GateNotMetError, 3),
+        (errors.OutputError, 4),
     ],
 )
 def test_exit_codes(cls, expected_code):
