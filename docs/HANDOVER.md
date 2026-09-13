@@ -22,7 +22,7 @@ Built for one user (Nawwaf, 20, degree apprentice at J.P. Morgan, ~1hr/day). Gen
 
 **Repo:** `https://github.com/nawwafnabdalla/jarvis` (public — review is done by cloning it, not reading summaries)
 
-**Latest commit:** WP-016 (D-024b/D-042, Stage 0's conclusion), on `main`. 399 tests passing under both invocations, 11/11 architecture contracts.
+**Latest commit:** `93f60b4` (WP-016, D-024b/D-042, Stage 0's conclusion), on `main`. 399 tests passing under both invocations, 11/11 architecture contracts.
 
 **Docs confirmed to actually exist in `docs/`** (checked directly): `DECISION_LOG.md`, `PRODUCT_BIBLE.md`, `TECHNICAL_BIBLE_1-4.md`, `WP-009-TZ-FINDING.md`, `STAGE_1A_RUNBOOK.md`, `HANDOVER.md` (this file, now committed to the repo rather than living outside it). `AUDIT_stage0_codebase_and_spec.md` still does not exist — no longer relevant now that Stage 0 has concluded.
 
