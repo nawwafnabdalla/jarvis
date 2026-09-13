@@ -48,7 +48,7 @@ Notation: `m(t)` = mid price = `(bid_c + ask_c)/2` at bar `t`. All prices in pri
 | 7 | `pre_london_high`, `pre_london_low`, `pre_london_range` | Extremes of the bid/ask mid over the `pre_london` window | 1 session | session_terminal | **High** |
 | 8 | `pre_london_range_pct(n=60)` | Percentile rank of today's `pre_london_range` within the trailing n trading days' values, **excluding today** | 60 days | session_terminal | **High** — off-by-one inclusion of today is the classic bug |
 | 9 | `pre_london_close_position` | `(m(session_end) − pre_london_low) / pre_london_range` | 1 session | session_terminal | High |
-| 10 | `london_high`, `london_low`, `london_range` | Same over `london` | 1 session | session_terminal | High |
+| 10 | `london_high`, `london_low`, `london_range`, `new_york_high`, `new_york_low`, `new_york_range` | Same over `london` and `new_york` (D-069: `new_york` was a real, defined session with no catalog row at all until this correction — R1 needs it, per its own Question text) | 1 session | session_terminal | High |
 | 11 | `prev_day_high`, `prev_day_low`, `prev_day_close` | Over `trading_day = D−1`, present bars only | 1 day | causal from 00:00 of D | Medium |
 | 12 | `prev_week_high`, `prev_week_low` | Over the prior trading week | 1 week | causal | Medium |
 | 13 | `dist_to(level)` | `(m(t) − level) / atr_bars(1440)`, signed, in ATR units | — | inherits | Inherits the level's class |
