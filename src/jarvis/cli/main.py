@@ -26,6 +26,7 @@ from jarvis.probe.report import (
     has_prior_widening,
     read_lineage,
     record_lineage_run,
+    reject_vault_range,
     run_probe,
 )
 from jarvis.probe.report import write_report as write_stage0_report
@@ -238,6 +239,7 @@ def data_resample(
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        reject_vault_range(end_ns, caller="data resample")
         root = repo_root()
 
         hours_expected = (end_ns - start_ns) // NS_PER_HOUR
@@ -281,6 +283,7 @@ def data_validate(
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        reject_vault_range(end_ns, caller="data validate")
         root = repo_root()
 
         hours_expected = (end_ns - start_ns) // NS_PER_HOUR
@@ -393,6 +396,7 @@ def features_build(
     try:
         start_ns = _parse_iso_utc_ns(from_, option_name="--from")
         end_ns = _parse_iso_utc_ns(to, option_name="--to")
+        reject_vault_range(end_ns, caller="features build")
         root = repo_root()
         names = tuple(n.strip() for n in features.split(",")) if features else tuple(REGISTRY)
 

@@ -267,9 +267,11 @@ def test_report_path_matches_naming_convention(repo: Path):
 
 
 def test_cli_exit_code_zero_when_no_errors(repo: Path, monkeypatch: pytest.MonkeyPatch):
+    # 2020, not 2024 (WP-012): jarvis data validate now enforces the vault
+    # boundary (2023-01-01), same as every other Stage 1A command.
     monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: repo)
-    hour = _hour_ns(2024, 1, 9, 3)
-    _write_ticks(repo, "GBPUSD", 2024, 1, [(hour, 0.99900, 1.00000, 1.0, 1.0)])
+    hour = _hour_ns(2020, 1, 9, 3)
+    _write_ticks(repo, "GBPUSD", 2020, 1, [(hour, 0.99900, 1.00000, 1.0, 1.0)])
     resample_range(repo, "GBPUSD", hour, Nanos(hour + NS_PER_HOUR))
 
     runner = CliRunner()
@@ -279,9 +281,9 @@ def test_cli_exit_code_zero_when_no_errors(repo: Path, monkeypatch: pytest.Monke
             "data",
             "validate",
             "--from",
-            "2024-01-09T03:00:00+00:00",
+            "2020-01-09T03:00:00+00:00",
             "--to",
-            "2024-01-09T04:00:00+00:00",
+            "2020-01-09T04:00:00+00:00",
         ],
     )
     assert result.exit_code == 0
@@ -289,9 +291,11 @@ def test_cli_exit_code_zero_when_no_errors(repo: Path, monkeypatch: pytest.Monke
 
 
 def test_cli_exit_code_three_when_error_present(repo: Path, monkeypatch: pytest.MonkeyPatch):
+    # 2020, not 2024 (WP-012): jarvis data validate now enforces the vault
+    # boundary (2023-01-01), same as every other Stage 1A command.
     monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: repo)
-    hour = _hour_ns(2024, 1, 9, 3)
-    _write_ticks(repo, "GBPUSD", 2024, 1, [(hour, 1.00000, 0.99900, 1.0, 1.0)])  # ask < bid -> E-01
+    hour = _hour_ns(2020, 1, 9, 3)
+    _write_ticks(repo, "GBPUSD", 2020, 1, [(hour, 1.00000, 0.99900, 1.0, 1.0)])  # ask < bid -> E-01
 
     runner = CliRunner()
     result = runner.invoke(
@@ -300,9 +304,9 @@ def test_cli_exit_code_three_when_error_present(repo: Path, monkeypatch: pytest.
             "data",
             "validate",
             "--from",
-            "2024-01-09T03:00:00+00:00",
+            "2020-01-09T03:00:00+00:00",
             "--to",
-            "2024-01-09T04:00:00+00:00",
+            "2020-01-09T04:00:00+00:00",
         ],
     )
     assert result.exit_code == 3

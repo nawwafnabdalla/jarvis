@@ -17,10 +17,10 @@ from jarvis.core.errors import IntegrityError, UserError
 from jarvis.core.hashing import canonical_json
 from jarvis.core.types import Nanos
 from jarvis.features import FEATURE_SET_VERSION, compute
-from jarvis.ingest.urls import NS_PER_HOUR, raw_blob_path
+from jarvis.ingest.histdata_import import tick_path
 from jarvis.qa import run_checks
 from jarvis.sessions import SessionSet, load_session_set
-from jarvis.timeengine import is_weekend_gap, trading_day, trading_day_bounds
+from jarvis.timeengine import NS_PER_HOUR, trading_day, trading_day_bounds
 
 from jarvis.probe.contexts import ContextEvent, ProbeParams, context_eligible_days, detect_events
 from jarvis.probe.gate import INTERSECTION_KEYS, GateResult, YearCounts, evaluate_gate
@@ -50,7 +50,37 @@ CC_FORWARD_WINDOW_CAVEAT = (
 # informed by holdout years is contamination at the highest level.
 VAULT_BOUNDARY_NS = Nanos(int(datetime(2023, 1, 1, tzinfo=timezone.utc).timestamp()) * 1_000_000_000)
 
-_MIN_ADMISSIBLE_HOURS_RATIO = 0.95
+
+def reject_vault_range(end_ns: Nanos, *, caller: str) -> None:
+    """Raise UserError if end_ns reaches into the sealed vault (2023-01-01
+    onward) -- PDLA-03/D-021: the vault is untouched by anything Stage 0
+    or Stage 1A related, including for descriptive purposes.
+
+    Strict >, not >=: end_ns is an EXCLUSIVE upper bound (this project's
+    [start, end) convention since WP-001), so end_ns == VAULT_BOUNDARY_NS
+    (2023-01-01T00:00:00Z) reads through 2022-12-31T23:59:59.999999999Z
+    and touches no vault data -- it must be ACCEPTED, not refused
+    (D-047a/WP-008-CORRECTION: an earlier `>=` here silently dropped
+    2022-12-31 from the gate, on the P10 leg deliberately most sensitive
+    to the worst year, to satisfy a literally-read acceptance criterion
+    that was itself in error).
+
+    WP-012: extracted from run_probe's own inline check (which was the
+    only one of the four Stage 1A commands enforcing this in code) so
+    every command that accepts a user-supplied end date can enforce the
+    vault boundary from one implementation instead of each carrying its
+    own copy that could drift. `caller` names the command in the error
+    message only."""
+    if end_ns > VAULT_BOUNDARY_NS:
+        raise UserError(
+            f"{caller}: --to exceeds the vault boundary (2023-01-01T00:00:00Z, "
+            f"end_ns={end_ns}) -- --to must not exceed 2023-01-01T00:00:00Z "
+            "(exclusive). The vault (2023 onward) is untouched, including for "
+            "descriptive purposes (PDLA-03/D-021)"
+        )
+
+
+_MIN_ADMISSIBLE_MONTHS_RATIO = 0.95
 _REQUIRED_FEATURES = ("pre_london_high", "pre_london_low", "pre_london_range_pct", "atr_bars")
 
 _WIDEN_TARGETS = {
@@ -164,28 +194,30 @@ def _year_bounds(year: int) -> tuple[Nanos, Nanos]:
     return Nanos(start), Nanos(end)
 
 
-def _hours_present_ratio(
-    repo_root: Path, instrument: str, year_start_ns: Nanos, year_end_ns: Nanos
-) -> float:
-    """Cheap (filesystem-only) data-completeness ratio: fraction of
-    trading-week hours in the year with a raw blob on disk. Deliberately
-    NOT the expensive tick-level jarvis.qa.run_checks pass -- that is
-    still required separately for the "zero QA ERRORs" half of
-    admissibility, but blob presence alone answers "hours present"
+def _months_present_ratio(repo_root: Path, instrument: str, year: int) -> float:
+    """Cheap (filesystem-only) data-completeness ratio: fraction of the
+    year's 12 calendar months with a data/tick/ Parquet file on disk.
+
+    WP-012: retargeted from Dukascopy raw-blob (hour-granular) presence to
+    the HistData-backed store (month-granular) -- reusing the same "a hole
+    is a wholly-missing month" model WP-010 already established for
+    resample_range and run_checks, rather than inventing a new signal.
+    This function predates WP-009/WP-010 and was out of scope for both
+    (neither package touched probe/); it still checked
+    jarvis.ingest.urls.raw_blob_path until this fix, which meant every
+    year measured 0% presence against data/raw/ticks/ (204 leftover hours
+    from an unrelated 2024-01 diagnostic, zero real 2006-2022 coverage)
+    and year_admissibility failed every year unconditionally --
+    see docs/STAGE_1A_RUNBOOK.md Section 0.
+
+    Deliberately NOT the expensive tick-level jarvis.qa.run_checks pass --
+    that is still required separately for the "zero QA ERRORs" half of
+    admissibility, but file presence alone answers "months present"
     without re-parsing a single tick."""
-    expected = 0
-    present = 0
-    for raw_hour in range(year_start_ns, year_end_ns, NS_PER_HOUR):
-        hour_ns = Nanos(raw_hour)
-        if is_weekend_gap(hour_ns):
-            continue
-        expected += 1
-        path = raw_blob_path(repo_root, instrument, hour_ns)
-        if path.is_file():
-            present += 1
-    if expected == 0:
-        return 0.0
-    return present / expected
+    present = sum(
+        1 for month in range(1, 13) if tick_path(repo_root, instrument, year, month).is_file()
+    )
+    return present / 12
 
 
 def _year_admissible_days(year: int) -> int:
@@ -207,15 +239,22 @@ def _year_admissible_days(year: int) -> int:
 
 
 def year_admissibility(repo_root: Path, instrument: str, year: int) -> bool:
-    """A year is admissible iff >= 95% of its expected trading-week hours
-    have a raw blob present AND jarvis.qa reports zero ERROR findings for
-    it. The (cheap) hours check runs first and short-circuits the
-    (expensive, full tick-level re-parse) QA check when it already
-    fails."""
-    year_start_ns, year_end_ns = _year_bounds(year)
-    ratio = _hours_present_ratio(repo_root, instrument, year_start_ns, year_end_ns)
-    if ratio < _MIN_ADMISSIBLE_HOURS_RATIO:
+    """A year is admissible iff >= 95% of its 12 calendar months have a
+    data/tick/ Parquet file present AND jarvis.qa reports zero ERROR
+    findings for it (WP-012: months check retargeted from Dukascopy
+    raw-blob hours -- see _months_present_ratio). The (cheap) months
+    check runs first and short-circuits the (expensive, full tick-level
+    re-parse) QA check when it already fails.
+
+    A partial year like 2006 (data/tick/ only holds 2006-09 through
+    2006-12, D-036's warmup range) correctly fails this on months alone
+    (4/12 = 33%) -- this is the mechanism D-036a relies on to exclude
+    warmup-only years from the gate without a separate truncated read
+    range; see docs/STAGE_1A_RUNBOOK.md Section 2."""
+    ratio = _months_present_ratio(repo_root, instrument, year)
+    if ratio < _MIN_ADMISSIBLE_MONTHS_RATIO:
         return False
+    year_start_ns, year_end_ns = _year_bounds(year)
     qa_report = run_checks(repo_root, instrument, year_start_ns, year_end_ns)
     return qa_report.errors == 0
 
@@ -320,24 +359,8 @@ def run_probe(
         raise UserError(f"start_ns ({start_ns}) and end_ns ({end_ns}) must both be hour-aligned")
     if start_ns >= end_ns:
         raise UserError(f"start_ns ({start_ns}) must be strictly before end_ns ({end_ns})")
-    # Strict >, not >=: end_ns is an EXCLUSIVE upper bound, matching this
-    # project's [start, end) convention since WP-001 (data fetch/resample/
-    # validate, features build). end_ns == VAULT_BOUNDARY_NS
-    # (2023-01-01T00:00:00Z) therefore reads through
-    # 2022-12-31T23:59:59.999999999Z and touches no vault data -- exactly
-    # PDLA-03/D-021's intent. WP-008-CORRECTION: an earlier `>=` here made
-    # 2022-12-31 permanently unreachable (silently dropping one trading
-    # day, on the P10 leg that is deliberately the most sensitive to the
-    # worst year) to satisfy a literally-read acceptance criterion that
-    # was itself in error; the criterion has been corrected instead.
-    if end_ns > VAULT_BOUNDARY_NS:
-        raise UserError(
-            f"end_ns ({end_ns}) exceeds the vault boundary "
-            f"({VAULT_BOUNDARY_NS}, 2023-01-01T00:00:00Z) -- --to must not exceed "
-            "2023-01-01T00:00:00Z (exclusive). Stage 0 runs on 2007-2022 only "
-            "(PDLA-03/D-021); the vault is untouched, including for descriptive "
-            "purposes"
-        )
+    # See reject_vault_range's own docstring for the strict->-not->= reasoning.
+    reject_vault_range(end_ns, caller="stage0 probe")
 
     params = widened_params(widen)
     session_set = load_session_set(session_set_id, session_set_version)
