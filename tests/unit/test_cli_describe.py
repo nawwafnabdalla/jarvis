@@ -40,10 +40,77 @@ def _synthetic_bars(n: int, *, start_utc: datetime, seed: int = 0) -> pl.DataFra
     )
 
 
-def test_report_r1_refuses_not_yet_implemented():
+def _weekday_bars(n_weekdays: int, *, start: datetime, seed: int = 0) -> pl.DataFrame:
+    """Real weekday-shaped bars (Sat/Sun skipped entirely) -- unlike
+    _synthetic_bars above, R1 genuinely needs this shape, since it
+    computes real session windows and trading-day day-of-week groupings
+    that a naive continuous run (R5 never cared about either) would
+    populate wrongly."""
+    rng = np.random.default_rng(seed)
+    rows: list[dict] = []
+    day = start
+    price = 1.3000
+    added = 0
+    while added < n_weekdays:
+        if day.weekday() < 5:
+            for m in range(24 * 60):
+                ts = int(day.timestamp()) * 1_000_000_000 + m * 60_000_000_000
+                price += float(rng.normal(0, 0.00003))
+                rows.append(
+                    {
+                        "ts_utc_ns": ts, "bid_o": price, "bid_h": price + 0.0002, "bid_l": price - 0.0002,
+                        "bid_c": price, "ask_o": price + 0.0002, "ask_h": price + 0.0004, "ask_l": price,
+                        "ask_c": price + 0.0002, "tick_count": 1, "first_tick_ns": ts, "last_tick_ns": ts,
+                        "spread_open": 0.0002, "spread_max": 0.0002, "spread_twa": 0.0002, "prev_gap_ns": None,
+                    }
+                )
+            added += 1
+        day = datetime.fromtimestamp(day.timestamp() + 86400, tz=timezone.utc)
+    return pl.DataFrame(rows)
+
+
+def test_describe_run_r1_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: tmp_path)
+
+    bars = _weekday_bars(15, start=datetime(2010, 1, 4, tzinfo=timezone.utc))
+    write_bars(tmp_path, "GBPUSD", 2010, 1, bars)
+
     result = runner.invoke(app, ["describe", "run", "--report", "R1"])
-    assert result.exit_code == 1
-    assert "not yet implemented" in result.output
+
+    assert result.exit_code == 0, result.output
+    assert "Bars examined" in result.output
+    assert "Sessions" in result.output
+    assert "Box plot" in result.output
+
+    describe_dir = tmp_path / "reports" / "describe"
+    md_files = list(describe_dir.glob("R1__*.md"))
+    parquet_files = list(describe_dir.glob("R1__*.parquet"))
+    svg_files = list(describe_dir.glob("R1__*__boxplot.svg"))
+    assert len(md_files) == 1
+    assert len(parquet_files) == 1
+    assert len(svg_files) == 1
+
+    md_text = md_files[0].read_text(encoding="utf-8")
+    assert md_text.startswith("# DESCRIPTIVE -- EXPLORATORY -- NOT EVIDENCE")
+    assert "R1 -- Session range anatomy" in md_text
+    for session in ("pre_london", "london", "new_york"):
+        assert f"`{session}` -- by year" in md_text
+
+    svg_text = svg_files[0].read_text(encoding="utf-8")
+    assert svg_text.startswith("<svg")
+
+
+def test_describe_run_r1_with_no_bars_still_writes_a_report(tmp_path, monkeypatch):
+    monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: tmp_path)
+
+    result = runner.invoke(app, ["describe", "run", "--report", "R1"])
+
+    assert result.exit_code == 0, result.output
+    describe_dir = tmp_path / "reports" / "describe"
+    md_files = list(describe_dir.glob("R1__*.md"))
+    assert len(md_files) == 1
+    md_text = md_files[0].read_text(encoding="utf-8")
+    assert "Bars examined: 0" in md_text
 
 
 def test_report_r2_refuses_not_yet_implemented():
