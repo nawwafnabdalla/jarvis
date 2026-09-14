@@ -16,15 +16,15 @@ Built for one user (Nawwaf, 20, degree apprentice at J.P. Morgan, ~1hr/day). Gen
 
 ## Current state
 
-**Stage 0 is genuinely, fully complete — including the real operational run, not just the scaffolding.** The full HistData ingest (WP-009 and its correction thread), WP-010 (resample/QA wired to the corrected dataset), and WP-012 (vault-boundary enforcement, `year_admissibility` fixed) were all prerequisites. On 2026-09-13, `docs/STAGE_1A_RUNBOOK.md` was executed for real — Resample → Validate → Features → Probe, against the full corrected 2006–2022 dataset — surfacing and fixing two genuine defects along the way (WP-013/D-063: a QA zero-spread false-positive and a sample-cap bug; WP-014/D-064: an INFO-check count-capping bug and a design flaw) plus one CLI output bug found by the run itself (WP-015/D-065: a Windows-console `UnicodeEncodeError` crash on the probe's own `∩` output character). The baseline probe returned `WIDEN_CONTEXT`; the one permitted widening attempt (`break_buffer_atr`, chosen and justified in writing before its result was known) moved the result only marginally and it stayed `WIDEN_CONTEXT` — a real gap in the original gate specification (D-024), since it never said what to do in that case. **D-024b rules on that gap** (EUR/USD fallback deferred not triggered, multi-pair rejected outright) and **D-042 is now finalized**: **GBP/USD is confirmed as the instrument going forward, not provisionally.**
+**Stage 0 is closed** (as originally recorded below — GBP/USD confirmed, D-042 final). **Stage 1A's operational run is complete and its corrections have propagated all the way through: the on-disk `data/tick/` and `data/bars_1m/` stores were rebuilt AFTER the DST/dedup/column-order fixes landed** (verified by file mtimes and an independent overnight audit — `data/tick/` rebuilt 2026-09-12, `data/bars_1m/` resampled from it a full day later on 2026-09-13, matching `STAGE_1A_RUNBOOK.md`'s execution record). **Stage 2 (market description) is no longer "next" — it has produced its first three reports.** R1 (session range anatomy), R2 (London range conditional on pre-London range percentile), and R5 (spread and cost climate) are all built, tested, and have each been run for real against the full 2007–2014 dataset (2,802,563 bars). This closes Stage 2 milestone 2C. **The project is now at Stage 2.5 — human hypothesis generation — which is explicitly "no engineering" per the roadmap.** No hypothesis has yet been registered; no Stage 3 work has begun.
 
-**Stage 0 is closed. Stage 2 (market description) is the next stage and has not been started.**
+R2 in particular produced a registered null: under the confirmed quintile-bucketing formulation, pre-London range compression showed no monotonic relationship with subsequent London range, pooled or by year (D-075/D-076). This is a legitimate, first-class research result, not a setback — see `docs/DECISION_LOG.md` D-075/D-076 and the overnight audit's findings for the full picture, including two real but modest gaps found during that audit: **AR-4's event calendar (Stage 2 milestone 2D) was never built** (still logged Active, no resolving entry — no scheduled-event exclusion flag exists anywhere R1/R2/R5 read), and **Stage 2 milestone 2A ("remaining features to complete the 19") is only partially done** — 6 of the Bible's 19 feature-catalog rows are registered (the ones R1/R2/R5 actually needed); the other 13 (ret_*, rv_ratio, dist_to, session_state, break_state, reentry_state, spread_now/pct, the three calendar features, prev_day/week extremes) remain unbuilt. Neither gap affects R1/R2/R5's own correctness (verified directly), but both are undisclosed in the reports themselves and worth the user's awareness before any Stage 3 planning.
 
 **Repo:** `https://github.com/nawwafnabdalla/jarvis` (public — review is done by cloning it, not reading summaries)
 
-**Latest commit:** `93f60b4` (WP-016, D-024b/D-042, Stage 0's conclusion), on `main`. 399 tests passing under both invocations, 11/11 architecture contracts.
+**Latest commit:** `4e2e18b` (WP-021, D-075/D-076, R2 built) plus this overnight audit's documentation-only follow-up, on `main`. 554 tests passing under both invocations, 11/11 architecture contracts held.
 
-**Docs confirmed to actually exist in `docs/`** (checked directly): `DECISION_LOG.md`, `PRODUCT_BIBLE.md`, `TECHNICAL_BIBLE_1-4.md`, `WP-009-TZ-FINDING.md`, `STAGE_1A_RUNBOOK.md`, `HANDOVER.md` (this file, now committed to the repo rather than living outside it). `AUDIT_stage0_codebase_and_spec.md` still does not exist — no longer relevant now that Stage 0 has concluded.
+**Docs confirmed to actually exist in `docs/`** (checked directly): `DECISION_LOG.md`, `PRODUCT_BIBLE.md`, `TECHNICAL_BIBLE_1-4.md`, `WP-009-TZ-FINDING.md`, `STAGE_1A_RUNBOOK.md`, `HANDOVER.md` (this file), `AUDIT_stage2_independent_20260913.md`, `STAGE_2_EVIDENCE_INDEX.md` (new — the human inspection route into R1/R2/R5).
 
 ### What's built
 
@@ -35,25 +35,29 @@ Built for one user (Nawwaf, 20, degree apprentice at J.P. Morgan, ~1hr/day). Gen
 | `timeengine` | UTC nanoseconds, IANA conversion, DST fold policy, trading day/week |
 | `sessions` | Versioned session sets, membership, windows, derived intersections |
 | `ingest` | HistData CSV ingest (primary, fully corrected) + Dukascopy fetcher (retained, dormant — see D-059) |
-| `bars` | Tick → 1-minute resampler, **now reading from `data/tick/` (the HistData store), not Dukascopy blobs** |
-| `qa` | Data-integrity checks, **retargeted to the HistData store**; Dukascopy-only fetch-log checks (E-04/W-06/E-05/E-06) dormant, not deleted |
-| `features` | 5 features + auto-generated leakage harness |
-| `probe` | Stage 0 contexts, two-tier gate, report — **run for real against the corrected dataset (2026-09-13); D-042 is final** |
-| `cli` | `jarvis` console script — output crash (WP-015) fixed, `OutputError`/exit 4 added |
+| `bars` | Tick → 1-minute resampler, reading from `data/tick/` (the HistData store) |
+| `qa` | Data-integrity checks, retargeted to the HistData store; Dukascopy-only checks dormant, not deleted |
+| `features` | 12 of 19 catalog rows registered (session ranges, `atr_bars`, `pre_london_range_pct`, `rv_60m`) + auto-generated leakage harness (L-1…L-5, redesigned under D-073) |
+| `probe` | Stage 0 contexts, two-tier gate, report — D-042 final |
+| `describe` | `periods.py` (fixed 2007-2014 Stage 2 range), `r1.py`, `r2.py`, `r5.py` — all three built, tested, run for real |
+| `reporting` | Shared furniture (watermark, sample-size suppression), `boxplot.py`, per-report renderers for R1/R2/R5 |
+| `cli` | `jarvis` console script; `describe run --report {R1,R2,R5}` wired |
+| `vault`, `strategies`, `strategy_impls`, `opportunities`, `execution`, `experiments`, `backtest`, `statistics`, `robustness`, `forward` | **Still empty skeletons** — Stage 3 onward, not started |
 
 ### What's NOT built
 
-- Stage 1B: dataset manifests, sealing, dataset versions
-- **Stage 2: market description engine — the next stage, not started**
-- Stages 3–6: strategy machinery, backtester, statistics, forward testing
+- Stage 1B: dataset manifests, sealing, dataset versions (R1/R2/R5 already disclose this — "Dataset version: not yet available")
+- AR-4's event calendar (Stage 2 milestone 2D) — Active in the decision log, no code, no resolving entry
+- The remaining 13 of 19 feature-catalog rows (Stage 2 milestone 2A, partially done)
+- AR-5's `GatedReader` capability-token vault boundary (Stage 1E) — the 2007-2014 restriction on R1/R2/R5 is enforced only by `describe_run` calling a fixed-constant function before loading bars, not structurally (D-061a, D-071 — confirmed still accurate by this audit)
+- Stages 3–6: strategy machinery, backtester, statistics, forward testing — genuinely untouched
+- R3, R4, R6 — explicitly gated by AR-6 on R1/R2/R5 being "used and found wanting" first; that use has not happened yet
 
 ---
 
 ## The one thing that must happen next
 
-**Stage 0 is closed.** The gate decision (D-042) is final: GBP/USD confirmed, per D-024b's ruling on the gap D-024 didn't originally cover (see the decision log). There is no outstanding Stage 0 work.
-
-**Stage 2 (market description) is next.** It has not been started — no scaffolding, no design work, nothing beyond the fact that it's the next stage on the roadmap (D-007). Carry `C-D∩C-C`'s narrowness (a wide pre-London range genuinely followed by a further breakout-continuation less often than the gate's 100/60 design assumed) forward as a known, evidenced characteristic of GBP/USD worth explaining there — not as an unresolved question.
+**Nothing engineering-shaped.** Stage 2.5 is explicitly "no engineering" (Technical Bible Part 4 §U). R1, R2 and R5 are built, tested, reproducible, and have been run for real. The next legitimate action is Nawwaf's own inspection of the evidence — see `docs/STAGE_2_EVIDENCE_INDEX.md` for the route in. Nothing should be built, characterized, or hypothesized ahead of that review; in particular, R3/R4/R6 remain out of scope until AR-6's "used and found wanting" gate is actually satisfied by a human, not inferred by an agent.
 
 ---
 
@@ -115,10 +119,14 @@ Built for one user (Nawwaf, 20, degree apprentice at J.P. Morgan, ~1hr/day). Gen
 
 **The Stage 1A operational run itself (WP-012 through WP-016 — see the decision log for full detail):** four more real defects, none hypothetical, all found only by actually executing the runbook rather than by reviewing it — a QA check's stale Dukascopy-era admissibility path (WP-012); a zero-spread false-positive plus a sample-display cap that was silently also capping a reported count (WP-013); a second, independent count-capping bug plus a check redesigned on investigated reasoning after its original design turned out to test nothing real (WP-014); a console-encoding crash in the CLI's own output layer that bypassed the entire error-handling framework (WP-015). Then a genuine gap in the frozen gate specification itself, D-024 — found by hitting it on the one permitted widening attempt, not by inspection — resolved by a deliberate ruling (D-024b) rather than worked around.
 
+**Stage 2's build (WP-018 through WP-021 — D-067 through D-076):** a date-scope conflict between C4b and AR-1 caught before any report ran (D-067); `n_resamples` tuned down for R5 on measured evidence, not intuition (D-068b); a missing `new_york_range` catalog row (D-069); an independent external audit's three findings (contract-vitality overstatement, a CLI-enforcement pattern, a skipped decision number) verified and logged rather than dismissed (D-070–D-072); a foundational masking-semantic defect found only by building R1 against a session (`new_york`) nothing had used before, which cascaded into a real day-attribution bug in `pre_london_range_pct` and a stale assumption in the leakage harness's own L-3 check — all three found, diagnosed with a genuine control (not just re-passing tests), and fixed rather than patched around (D-073); an ATR-warmup-driven day-count discrepancy traced to its actual mechanism rather than adjusted until the test passed (D-074); a quintile-bucketing method resolved from the literal meaning of "quintile" plus a real discreteness discovery (61 possible values, not a continuous score) that made tie-handling the load-bearing design decision, confirmed against real data afterward rather than assumed (D-075); and, found by an overnight independent audit explicitly tasked with distrusting prior summaries, a transposed pair of digits in D-075's own prose, resolved against three independent primary sources (D-076).
+
+**That overnight audit itself (2026-09-15, no WP number — explicitly "no engineering" per Stage 2.5) is worth naming as its own data point:** tasked with reconstructing Jarvis's state from primary evidence rather than inherited narrative, it found the D-075 transcription error above, confirmed (not merely trusted) that the DST/dedup/column-order fixes actually reached the on-disk bars R1/R2/R5 read (via file mtimes, not just code review), found AR-4's event calendar and Stage 2 milestone 2A silently incomplete with no decision-log entry disclosing either gap, found this very document (HANDOVER.md) had gone stale describing Stage 0 as current, and found a real (if practically negligible on the actual dataset) hidden-denominator possibility in R5's hour-of-week table between its displayed `n` and the range-CI's own separately-null-dropped sample size. See `docs/DECISION_LOG.md` D-076 and `docs/STAGE_2_EVIDENCE_INDEX.md` for the full account.
+
 ---
 
 ## Immediate next steps
 
-Stage 0 has no outstanding work. **Stage 2 (market description) is next** and has not been started — no scaffolding exists yet. When that work begins, carry forward: `C-D∩C-C`'s narrowness as a known, evidenced characteristic of GBP/USD (D-024b/D-042), and the same working-process discipline that found four real defects during Stage 1A's execution alone — verify against the real repository and real run output, never against a narrative summary.
+**Nothing engineering-shaped is next.** Stage 2.5 is explicitly "no engineering" (Technical Bible Part 4 §U) — the next legitimate action belongs to Nawwaf: inspect R1/R2/R5 via `docs/STAGE_2_EVIDENCE_INDEX.md` and decide, on the evidence, whether any of them is "used and found wanting" enough to justify AR-6 releasing R3/R4/R6, or whether a Stage 3 hypothesis is warranted at all. Carry forward the same working-process discipline that has found real defects at every stage so far, including this audit itself: verify against the real repository and real run output, never against a narrative summary — including this one.
 
-Everything from Stage 1B onward remains untouched and unstarted.
+Everything from Stage 1B onward beyond what's listed as built above remains untouched and unstarted.
