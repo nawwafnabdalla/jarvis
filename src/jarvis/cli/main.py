@@ -18,6 +18,7 @@ from jarvis.core.hashing import sha256_file
 from jarvis.core.types import Nanos
 from jarvis.describe.periods import stage2_descriptive_range
 from jarvis.describe.r1 import compute_r1
+from jarvis.describe.r2 import compute_r2
 from jarvis.describe.r5 import compute_r5
 from jarvis.features import REGISTRY, compute, write_features
 from jarvis.ingest.fetch import ingest_range
@@ -34,6 +35,7 @@ from jarvis.probe.report import (
 from jarvis.probe.report import write_report as write_stage0_report
 from jarvis.qa.report import run_checks, write_report
 from jarvis.reporting.describe_r1 import write_r1_report
+from jarvis.reporting.describe_r2 import write_r2_report
 from jarvis.reporting.describe_r5 import write_r5_report
 from jarvis.sessions import load_session_set
 
@@ -183,7 +185,7 @@ describe_app = typer.Typer(name="describe", help="Stage 2 market description rep
 app.add_typer(describe_app, name="describe")
 
 _INSTRUMENT = "GBPUSD"
-_IMPLEMENTED_REPORTS = ("R1", "R5")
+_IMPLEMENTED_REPORTS = ("R1", "R2", "R5")
 
 
 def _parse_iso_utc_ns(value: str, *, option_name: str) -> Nanos:
@@ -576,7 +578,7 @@ def stage0_probe(
 
 @describe_app.command("run")
 def describe_run(
-    report: str = typer.Option(..., "--report", help="R1|R2|R5 (R1 and R5 are implemented so far)"),
+    report: str = typer.Option(..., "--report", help="R1|R2|R5 (R1, R2 and R5 are implemented so far)"),
     year: int = typer.Option(
         None,
         "--year",
@@ -625,6 +627,20 @@ def describe_run(
                 f"  Report             {md_path}",
                 f"  Sidecar            {parquet_path}",
                 f"  Box plot           {svg_path}",
+                f"  Elapsed            {_format_elapsed(elapsed)}",
+            ]
+        elif report == "R2":
+            session_set = load_session_set("fx_core", 1)
+            r2_result = compute_r2(bars, session_set, start_ns=start_ns, end_ns=end_ns)
+            md_path, parquet_path = write_r2_report(root, r2_result)
+            elapsed = time.perf_counter() - started
+            summary_lines = [
+                "",
+                f"  Bars examined      {r2_result.bars_examined}",
+                f"  Pooled buckets     {len(r2_result.pooled)}",
+                f"  Year rows          {len(r2_result.by_year)}",
+                f"  Report             {md_path}",
+                f"  Sidecar            {parquet_path}",
                 f"  Elapsed            {_format_elapsed(elapsed)}",
             ]
         else:

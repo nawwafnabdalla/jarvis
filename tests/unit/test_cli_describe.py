@@ -113,8 +113,47 @@ def test_describe_run_r1_with_no_bars_still_writes_a_report(tmp_path, monkeypatc
     assert "Bars examined: 0" in md_text
 
 
-def test_report_r2_refuses_not_yet_implemented():
+def test_describe_run_r2_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: tmp_path)
+
+    bars = _weekday_bars(70, start=datetime(2010, 1, 4, tzinfo=timezone.utc))
+    write_bars(tmp_path, "GBPUSD", 2010, 1, bars)
+
     result = runner.invoke(app, ["describe", "run", "--report", "R2"])
+
+    assert result.exit_code == 0, result.output
+    assert "Bars examined" in result.output
+    assert "Pooled buckets" in result.output
+    assert "Year rows" in result.output
+
+    describe_dir = tmp_path / "reports" / "describe"
+    md_files = list(describe_dir.glob("R2__*.md"))
+    parquet_files = list(describe_dir.glob("R2__*.parquet"))
+    assert len(md_files) == 1
+    assert len(parquet_files) == 1
+
+    md_text = md_files[0].read_text(encoding="utf-8")
+    assert md_text.startswith("# DESCRIPTIVE -- EXPLORATORY -- NOT EVIDENCE")
+    assert "R2 -- London range conditional on pre-London range percentile" in md_text
+    assert "## Pooled" in md_text
+    assert "## By year" in md_text
+
+
+def test_describe_run_r2_with_no_bars_still_writes_a_report(tmp_path, monkeypatch):
+    monkeypatch.setattr("jarvis.cli.main.repo_root", lambda: tmp_path)
+
+    result = runner.invoke(app, ["describe", "run", "--report", "R2"])
+
+    assert result.exit_code == 0, result.output
+    describe_dir = tmp_path / "reports" / "describe"
+    md_files = list(describe_dir.glob("R2__*.md"))
+    assert len(md_files) == 1
+    md_text = md_files[0].read_text(encoding="utf-8")
+    assert "Bars examined: 0" in md_text
+
+
+def test_report_r3_refuses_not_yet_implemented():
+    result = runner.invoke(app, ["describe", "run", "--report", "R3"])
     assert result.exit_code == 1
     assert "not yet implemented" in result.output
 
