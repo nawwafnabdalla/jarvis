@@ -159,29 +159,74 @@ def session_window_bounds(
 def apply_session_terminal_mask(
     series: pl.Series, bars: pl.DataFrame, session_set: SessionSet, session_name: str
 ) -> pl.Series:
-    """Null out `series` for every bar with ts_utc_ns < that trading day's
-    named-session window end. This is the mechanical enforcement behind
-    leakage_class == "session_terminal" (Technical Bible Part F §F.2): a
-    session_terminal feature's raw compute() may return a value for every
-    bar of the day (the eventual terminal value, broadcast), and THIS
-    function is what actually makes it invisible before the window
-    closes -- independent of whatever the feature's own compute() did or
-    didn't do, so a bug in one feature's own masking logic cannot leak
-    data (defence in depth, not the only line of defence)."""
+    """WP-020/D-073: reveals the most recently COMPLETED instance of the
+    named session, not "today's own instance, once today's window has
+    closed." For a bar before its own trading day's window has closed,
+    this shows the last prior trading day's already-completed value
+    (forward-filled through any day with no bars of its own, e.g. a
+    weekend or a hole) -- never null merely because today's own instance
+    isn't finished yet, as long as SOME earlier instance exists. Null
+    only when no session instance has ever completed yet (the very start
+    of the data) or every session instance seen so far, including
+    today's, had no bars in its own window.
+
+    This generalises what was previously a same-trading-day-only rule
+    (see D-073 for why: `new_york`'s own window end coincides exactly
+    with the trading-day rollover instant it shares an anchor with, so
+    "constant for the remainder of the trading day" was always a
+    zero-width, never-revealed window for that one session -- not a bug
+    in any feature's own compute(), a gap in this shared masking rule).
+    For `pre_london`/`london`, whose windows close hours before day-end,
+    this reproduces the exact prior behaviour for the "after today's own
+    close" case and adds real, previously-untested coverage for the
+    "before today's own close" case -- D-073 verified directly that the
+    prior code never actually carried a prior day's value into a new day
+    at all, so this is a genuine behaviour addition, not a no-op
+    generalisation.
+
+    `series` is `compute()`'s per-bar broadcast of "this bar's own
+    trading day's eventual value" (every bar of a given day carries the
+    same value, per the session_terminal compute contract) -- this
+    function turns that into the correct point-in-time-visible series;
+    it does not trust or reuse anything a feature's own compute() did
+    beyond that per-day broadcast, per Technical Bible Part F §F.2's
+    "the framework enforces it, independent of what any individual
+    feature's own compute() function returns" (WP-020 also corrects
+    F.2's own prior text, which described only the same-day case)."""
     if bars.height == 0:
         return series
 
     days, day_idx = trading_day_boundaries(bars)
     _starts, ends = session_window_bounds(session_set, session_name, days)
     ts = bars["ts_utc_ns"].to_numpy()
-    bar_window_end = ends[day_idx]
-    hide = ts < bar_window_end
+    n_days = len(days)
 
-    # pl.when/then/otherwise builds an Expr, not a Series -- it must be
-    # evaluated against a DataFrame (via select) to get a concrete Series
-    # back out.
-    tmp = pl.DataFrame({"_val": series, "_hide": hide})
-    result = tmp.select(
-        pl.when(pl.col("_hide")).then(None).otherwise(pl.col("_val")).alias(series.name)
-    )
-    return result[series.name]
+    # Recover one value per day from the per-bar broadcast: every bar of
+    # a given day carries that day's own (possibly NaN) value, so a
+    # fancy-index assignment collapses them back to one entry per day.
+    # A day untouched by any bar (day_idx never equals it -- a weekend,
+    # or simply outside this bars frame's own coverage) stays NaN.
+    day_values = np.full(n_days, np.nan, dtype=np.float64)
+    day_values[day_idx] = series.to_numpy()
+
+    # Forward-fill across days: a day with no bars of its own (and thus
+    # no value of its own) inherits the last genuinely-completed prior
+    # day's value, so a market-closed day never masks an otherwise-valid
+    # "most recently completed" answer.
+    filled = day_values.copy()
+    last = np.nan
+    for i in range(n_days):
+        if np.isnan(filled[i]):
+            filled[i] = last
+        else:
+            last = filled[i]
+
+    bar_window_end = ends[day_idx]
+    own_day_closed = ts >= bar_window_end
+    effective_day_idx = np.where(own_day_closed, day_idx, day_idx - 1)
+
+    revealed = np.full(len(ts), np.nan, dtype=np.float64)
+    valid = effective_day_idx >= 0
+    revealed[valid] = filled[effective_day_idx[valid]]
+
+    return pl.Series(series.name, revealed).fill_nan(None)

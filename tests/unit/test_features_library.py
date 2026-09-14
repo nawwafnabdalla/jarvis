@@ -165,6 +165,78 @@ def test_pre_london_null_when_window_has_no_bars():
     assert result.frame["pre_london_range"].null_count() == result.frame.height
 
 
+def test_pre_london_day_boundary_shows_previous_days_value():
+    """WP-020/D-073's core required gate: before day 2's OWN pre_london
+    window has closed, day 2's early bars must show day 1's ALREADY-
+    COMPLETED pre_london_high/low/range, not null -- the previous
+    session-terminal masking rule (D-073 replaces) would have wrongly
+    nulled this, and the 5 original single-day-fixture tests above never
+    exercised a day boundary at all (each uses one calendar day only)."""
+    day1, day2 = date(2024, 1, 15), date(2024, 1, 16)
+    bars = pl.concat(
+        [_pre_london_frame(day1), _pre_london_frame(day2, extra_after_close=False)]
+    ).sort("ts_utc_ns")
+    result = compute(["pre_london_high", "pre_london_low", "pre_london_range"], bars, _SESSION_SET)
+
+    day1_final = result.frame.filter(pl.col("ts_utc_ns") == _ns(2024, 1, 15, 8, 2)).row(0, named=True)
+    assert day1_final["pre_london_high"] is not None
+
+    day2_early = result.frame.filter(pl.col("ts_utc_ns") == _ns(2024, 1, 16, 3, 0)).row(0, named=True)
+    assert day2_early["pre_london_high"] is not None
+    assert day2_early["pre_london_high"] == day1_final["pre_london_high"]
+    assert day2_early["pre_london_low"] == day1_final["pre_london_low"]
+    assert day2_early["pre_london_range"] == day1_final["pre_london_range"]
+
+
+def test_new_york_null_then_reveal_then_update_across_three_days():
+    """D-073's defining case: new_york's own window close coincides with
+    the trading-day rollover, so it can never reveal "today's own" value
+    within "today" at all -- every bar of trading day D shows day D-1's
+    already-completed value (or null if none exists yet). Three
+    consecutive days, each with a DISTINCT new_york range, prove the
+    full null -> reveal -> update sequence rather than just one step
+    of it: day 1 (no prior day at all) is null throughout; day 2 shows
+    day 1's value throughout; day 3 shows day 2's (not day 1's) value
+    throughout -- confirming the reveal genuinely updates, not just
+    turns on once."""
+    day1, day2, day3 = date(2024, 1, 15), date(2024, 1, 16), date(2024, 1, 17)
+
+    def _ny_frame_with_range(day: date, low_price: float) -> pl.DataFrame:
+        day_start = int(datetime(day.year, day.month, day.day, 13, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+        rows = [
+            _row(Nanos(day_start), bid_h=low_price, bid_l=low_price, bid_c=low_price),
+            _row(Nanos(day_start + NS_PER_MINUTE), bid_h=low_price + 0.0010, bid_l=low_price + 0.0010, bid_c=low_price + 0.0010),
+        ]
+        return _frame(rows)
+
+    bars = pl.concat(
+        [
+            _ny_frame_with_range(day1, 1.1000),  # range = 0.0010
+            _ny_frame_with_range(day2, 1.2000),  # range = 0.0010, distinct price band
+            _ny_frame_with_range(day3, 1.3000),  # range = 0.0010, distinct price band
+        ]
+    ).sort("ts_utc_ns")
+
+    result = compute(["new_york_high", "new_york_low", "new_york_range"], bars, _SESSION_SET)
+
+    day1_rows = result.frame.filter(pl.col("ts_utc_ns") < _ns(2024, 1, 16, 0, 0))
+    assert day1_rows.height > 0
+    assert day1_rows["new_york_high"].null_count() == day1_rows.height
+
+    day2_rows = result.frame.filter(
+        (pl.col("ts_utc_ns") >= _ns(2024, 1, 16, 0, 0)) & (pl.col("ts_utc_ns") < _ns(2024, 1, 17, 0, 0))
+    )
+    assert day2_rows.height > 0
+    assert day2_rows["new_york_high"].null_count() == 0
+    assert day2_rows["new_york_high"].n_unique() == 1
+    assert day2_rows["new_york_high"][0] == pytest.approx(1.1011, abs=1e-9)  # day 1's high (mid, not bid)
+
+    day3_rows = result.frame.filter(pl.col("ts_utc_ns") >= _ns(2024, 1, 17, 0, 0))
+    assert day3_rows.height > 0
+    assert day3_rows["new_york_high"].null_count() == 0
+    assert day3_rows["new_york_high"][0] == pytest.approx(1.2011, abs=1e-9)  # day 2's high, not day 1's
+
+
 def test_pre_london_uses_mid_not_bid_or_ask():
     """Tick A has the highest bid but a low ask; tick B has a low bid but
     the highest ask. Neither the bid-only nor ask-only extreme equals the
@@ -197,6 +269,153 @@ def test_pre_london_uses_mid_not_bid_or_ask():
     assert after["pre_london_low"][0] not in (pytest.approx(1.0950), pytest.approx(1.1052))
 
 
+# london_high / london_low / london_range; new_york_high / low / range -----
+# (WP-020/D-069: session-generic since _session_extreme_compute /
+# _session_range_compute replaced the pre_london-hardcoded originals.
+# Mirrors the pre_london tests above exactly, adjusted only for each
+# session's own UTC window on the same January test date -- winter, so
+# no DST reasoning is needed, matching this file's existing convention.)
+
+
+def _london_frame(day: date, *, extra_after_close: bool = True) -> pl.DataFrame:
+    """One trading day with bars every minute through the london window
+    (08:00-16:30 UTC in January -- Europe/London is GMT in winter) and a
+    few bars after close."""
+    day_start = Nanos(int(datetime(day.year, day.month, day.day, 8, tzinfo=timezone.utc).timestamp()) * 1_000_000_000)
+    rows = []
+    window_minutes = 8 * 60 + 30
+    for m in range(window_minutes):
+        ts = Nanos(day_start + m * NS_PER_MINUTE)
+        price = 1.2000 + 0.0001 * math.sin(m / 17.0)
+        rows.append(_row(ts, bid_h=price + 0.0003, bid_l=price - 0.0003, bid_c=price))
+    if extra_after_close:
+        for m in range(3):
+            ts = Nanos(day_start + (window_minutes + m) * NS_PER_MINUTE)
+            rows.append(_row(ts, bid_h=1.2005, bid_l=1.1995, bid_c=1.2000))
+    return _frame(rows)
+
+
+def _new_york_frame(day: date, *, extra_after_close: bool = True) -> pl.DataFrame:
+    """One trading day with bars every minute through the new_york window
+    (13:00-22:00 UTC in January -- America/New_York is EST=UTC-5 in
+    winter) and a few bars after close."""
+    day_start = Nanos(int(datetime(day.year, day.month, day.day, 13, tzinfo=timezone.utc).timestamp()) * 1_000_000_000)
+    rows = []
+    window_minutes = 9 * 60
+    for m in range(window_minutes):
+        ts = Nanos(day_start + m * NS_PER_MINUTE)
+        price = 1.3000 + 0.0001 * math.sin(m / 17.0)
+        rows.append(_row(ts, bid_h=price + 0.0003, bid_l=price - 0.0003, bid_c=price))
+    if extra_after_close:
+        for m in range(3):
+            ts = Nanos(day_start + (window_minutes + m) * NS_PER_MINUTE)
+            rows.append(_row(ts, bid_h=1.3005, bid_l=1.2995, bid_c=1.3000))
+    return _frame(rows)
+
+
+@pytest.mark.parametrize(
+    "session,frame_builder,window_end",
+    [
+        ("london", _london_frame, (16, 30)),
+        ("new_york", _new_york_frame, (22, 0)),
+    ],
+)
+def test_session_generic_null_before_window_close(session, frame_builder, window_end):
+    bars = frame_builder(date(2024, 1, 15))
+    names = [f"{session}_high", f"{session}_low", f"{session}_range"]
+    result = compute(names, bars, _SESSION_SET)
+
+    mid_ts = _ns(2024, 1, 15, window_end[0] - 1, 0)
+    row = result.frame.filter(pl.col("ts_utc_ns") == mid_ts).row(0, named=True)
+    assert row[f"{session}_high"] is None
+    assert row[f"{session}_low"] is None
+    assert row[f"{session}_range"] is None
+
+
+@pytest.mark.parametrize(
+    "session,frame_builder,window_end",
+    [
+        ("london", _london_frame, (16, 30)),
+        ("new_york", _new_york_frame, (22, 0)),
+    ],
+)
+def test_session_generic_constant_after_window_close(session, frame_builder, window_end):
+    bars = frame_builder(date(2024, 1, 15))
+    names = [f"{session}_high", f"{session}_low", f"{session}_range"]
+    result = compute(names, bars, _SESSION_SET)
+
+    after = result.frame.filter(pl.col("ts_utc_ns") >= _ns(2024, 1, 15, *window_end))
+    assert after.height > 0
+    assert after[f"{session}_high"].n_unique() == 1
+    assert after[f"{session}_low"].n_unique() == 1
+    assert after[f"{session}_range"].n_unique() == 1
+    assert after[f"{session}_high"].null_count() == 0
+
+
+@pytest.mark.parametrize("session", ["london", "new_york"])
+def test_session_generic_null_when_window_has_no_bars(session):
+    day = date(2024, 1, 15)
+    day_start = _ns(2024, 1, 15, 0, 0)
+    # Bars only right around midnight -- nothing inside either session's
+    # actual UTC window (08:00-16:30 for london, 13:00-22:00 for new_york).
+    rows = [_row(Nanos(day_start + m * NS_PER_MINUTE), bid_h=1.1005, bid_l=1.0995, bid_c=1.1000) for m in range(60)]
+    bars = _frame(rows)
+
+    names = [f"{session}_high", f"{session}_low", f"{session}_range"]
+    result = compute(names, bars, _SESSION_SET)
+    assert result.frame[f"{session}_high"].null_count() == result.frame.height
+    assert result.frame[f"{session}_low"].null_count() == result.frame.height
+    assert result.frame[f"{session}_range"].null_count() == result.frame.height
+
+
+def test_session_generic_values_are_independent_per_session():
+    """A single real bars frame (one row per minute -- london and
+    new_york's real trading hours genuinely overlap 13:00-16:30 UTC, so
+    two separately-priced synthetic frames concatenated over that range
+    would create duplicate timestamps no real bars data ever has) with a
+    price path that peaks at a distinct, known level inside london-only
+    hours (10:00, before new_york opens) and again at a different known
+    level inside new_york-only hours (19:00, after london has closed).
+    london_high must reflect only the first peak, new_york_high only the
+    second -- proving neither session's extreme leaks from the other's
+    window, not just that each individually computes something."""
+    day = date(2024, 1, 15)
+    day_start = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp()) * 1_000_000_000
+    london_peak_price = 1.2500  # at 10:00 UTC -- inside london (08:00-16:30), outside new_york (13:00-22:00)
+    ny_peak_price = 1.2200  # at 19:00 UTC -- inside new_york, outside london
+    base_price = 1.2000
+
+    rows = []
+    for m in range(24 * 60):
+        ts = Nanos(day_start + m * NS_PER_MINUTE)
+        hour = m // 60
+        price = london_peak_price if hour == 10 else (ny_peak_price if hour == 19 else base_price)
+        rows.append(_row(ts, bid_h=price, bid_l=price, bid_c=price, ask_c=price))  # ask=bid -> mid == price exactly
+    bars = _frame(rows)
+
+    result = compute(
+        ["london_high", "london_low", "new_york_high", "new_york_low"], bars, _SESSION_SET
+    )
+
+    # london's own close is same-day (16:30 UTC); query any bar after it.
+    after_london_close = result.frame.filter(pl.col("ts_utc_ns") == _ns(2024, 1, 15, 17, 0)).row(0, named=True)
+    london_high = after_london_close["london_high"]
+
+    # new_york's own close coincides with the trading-day rollover
+    # (D-073) -- its day-1 value is only ever visible starting day 2.
+    day2 = _ns(2024, 1, 16, 0, 0)
+    next_day_bars = _frame(
+        [_row(Nanos(day2), bid_h=base_price, bid_l=base_price, bid_c=base_price, ask_c=base_price)]
+    )
+    result2 = compute(["new_york_high"], pl.concat([bars, next_day_bars]), _SESSION_SET)
+    ny_high = result2.frame.filter(pl.col("ts_utc_ns") == day2).row(0, named=True)["new_york_high"]
+
+    assert london_high == pytest.approx(london_peak_price, abs=1e-9)
+    assert ny_high == pytest.approx(ny_peak_price, abs=1e-9)
+    assert london_high != pytest.approx(ny_peak_price, abs=1e-6)
+    assert ny_high != pytest.approx(london_peak_price, abs=1e-6)
+
+
 # pre_london_range_pct -------------------------------------------------------
 
 
@@ -206,7 +425,16 @@ def test_range_pct_excludes_today():
     """Today's range is the maximum ever seen. pct == 1.0 is reachable
     ONLY if today is excluded from its own reference distribution -- if
     it were included, the best today could ever score is 60/61, never
-    a clean 1.0."""
+    a clean 1.0.
+
+    WP-020/D-073 note: checked directly -- this construction (strictly
+    increasing priors, today far above all of them) still computes
+    pct=1.0 even under the shift-by-one day-attribution bug D-073 fixed
+    (the shifted "today" value, itself one day stale, is still larger
+    than every shifted prior). This test does NOT distinguish correct
+    day-attribution from that bug; it passed throughout, undetecting it.
+    See test_range_pct_day_attribution_not_shifted for a test built
+    specifically to fail loudly under that bug."""
     days = _weekdays_from(date(2024, 1, 1), 61)
     day_ranges = [(d, 0.0010 + 0.00001 * i) for i, d in enumerate(days[:60])]
     day_ranges.append((days[60], 0.01))  # today: far larger than every prior day
@@ -219,6 +447,13 @@ def test_range_pct_excludes_today():
 
 
 def test_range_pct_null_below_60_prior_days():
+    """WP-020/D-073 note: checked directly -- every day in this fixture
+    gets a valid range, so the warmup boundary (eligible-count 59 vs 60)
+    this test checks is unaffected by the shift-by-one day-attribution
+    bug D-073 fixed (the bug shifts WHICH value a day reports, not
+    WHETHER it has one). This test does not distinguish correct
+    day-attribution from that bug either. See
+    test_range_pct_day_attribution_not_shifted."""
     days_59 = _weekdays_from(date(2024, 1, 1), 60)  # 59 priors + 1 today
     day_ranges_59 = [(d, 0.0010 + 0.00001 * i) for i, d in enumerate(days_59[:59])]
     day_ranges_59.append((days_59[59], 0.005))
@@ -236,6 +471,38 @@ def test_range_pct_null_below_60_prior_days():
     today_60 = _ns(days_60[60].year, days_60[60].month, days_60[60].day, 8, 0)
     row_60 = result_60.frame.filter(pl.col("ts_utc_ns") >= today_60).row(0, named=True)
     assert row_60["pre_london_range_pct"] is not None
+
+
+def test_range_pct_day_attribution_not_shifted():
+    """Decisive test for the shift-by-one day-attribution bug D-073
+    fixed (WP-020): built specifically so a one-day shift produces a
+    DIFFERENT, precisely wrong number, not a coincidentally-correct one
+    (unlike the two tests directly above, annotated as insensitive to it).
+
+    59 uniform-low priors (0.0010), then ONE deliberate high outlier on
+    the single prior immediately before today (day 59, range 0.0090),
+    then today at 0.0050 -- between the two.
+
+    Correct attribution: prior = 59x0.0010 + 1x0.0090; today=0.0050 is
+    greater than the 59 uniform values and NOT greater than the 0.0090
+    outlier -> pct = 59/60.
+
+    Under a shift-by-one bug, day 59's outlier leaks into TODAY's own
+    slot instead (today reads as 0.0090, not 0.0050), and the real
+    prior window becomes 60 uniform 0.0010 values (the outlier having
+    been pushed out of it) -> pct = 60/60 = 1.0. 59/60 and 60/60 are far
+    enough apart that pytest.approx(abs=1e-9) cannot conflate them --
+    this fails loudly, not by luck, if the bug regresses."""
+    days = _weekdays_from(date(2024, 1, 1), 61)
+    day_ranges = [(d, 0.0010) for d in days[:59]]
+    day_ranges.append((days[59], 0.0090))  # the one deliberate outlier, immediately before today
+    day_ranges.append((days[60], 0.0050))  # today
+    bars = _multi_day_pre_london(day_ranges)
+
+    result = compute(["pre_london_range_pct"], bars, _SESSION_SET)
+    today_ns = _ns(days[60].year, days[60].month, days[60].day, 8, 0)
+    row = result.frame.filter(pl.col("ts_utc_ns") >= today_ns).row(0, named=True)
+    assert row["pre_london_range_pct"] == pytest.approx(59 / 60, abs=1e-9)
 
 
 def test_range_pct_tie_uses_strict_less_than():

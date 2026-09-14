@@ -74,10 +74,13 @@ def _shuffle_future(bars: pl.DataFrame, k: int, seed: int = 99) -> pl.DataFrame:
     The property under test is unchanged: no value at index <= k may
     depend on any price at index > k. This holds even for
     session_terminal features across the k boundary -- if k falls inside
-    a still-open session window, values at <= k are null and stay null;
-    if k falls after that window's close, the day's terminal value was
-    already fixed by bars at or before the window's end, all of which are
-    at or before k or otherwise untouched here."""
+    a still-open session window, values at <= k reflect only prior,
+    already-completed instances of that session (D-073: never null
+    merely because THIS day's own instance isn't finished yet, but never
+    THIS day's own not-yet-closed value either); if k falls after that
+    window's close, the day's own terminal value was already fixed by
+    bars at or before the window's end, all of which are at or before k
+    or otherwise untouched here."""
     n = bars.height
     if k + 1 >= n:
         return bars
@@ -160,7 +163,65 @@ _SESSION_TERMINAL_NAMES = sorted(
 
 
 @pytest.mark.parametrize("feature_name", _SESSION_TERMINAL_NAMES)
-def test_l3_session_terminal_nulling(feature_name: str, fixture_bars: pl.DataFrame):
+def test_l3_session_terminal_same_day_causality(feature_name: str, fixture_bars: pl.DataFrame):
+    """WP-020/D-073: session_terminal masking now reveals the most
+    recently COMPLETED instance of a session, not "null until my own
+    trading day's own window has closed" -- a day's early bars may
+    legitimately show a PRIOR day's already-closed value (D-073). Plain
+    same-day nulling is no longer the invariant that protects against
+    leakage; what must still hold, comprehensively, not just at L-1's one
+    arbitrary truncation point, is that a bar strictly before ITS OWN
+    day's window has closed must never depend on anything from later in
+    that same day -- specifically, it must never see that day's OWN
+    eventual value before that value has actually closed.
+
+    For every trading day in the fixture with a genuine before-close bar,
+    reuses L-1's own truncation-invariance primitive (`_l1_holds`) at
+    that bar's own index: if extending the fixture with the rest of that
+    day's bars (through and past that day's own window close) ever
+    changes the value already computed at the before-close bar, that is
+    exactly a same-day leak, and L-1's machinery already catches it --
+    this just targets it precisely, once per day, rather than only at
+    one arbitrary fixed point."""
+    from jarvis.features.base import session_window_bounds, trading_day_boundaries
+
+    defn = REGISTRY[feature_name]
+    session_name = str(defn.params["session"])
+
+    days, day_idx = trading_day_boundaries(fixture_bars)
+    _starts, ends = session_window_bounds(_SESSION_SET, session_name, days)
+    ts = fixture_bars["ts_utc_ns"].to_numpy()
+    window_end = ends[day_idx]
+    before_close = ts < window_end
+
+    before_close_indices = np.nonzero(before_close)[0]
+    assert before_close_indices.size > 0  # the fixture must actually cover a pre-close bar
+
+    checked_days: set[int] = set()
+    for idx in before_close_indices:
+        if idx == 0:
+            continue  # _l1_holds needs a non-empty bars[:idx] slice; index 0's own
+            # nulling (no data at all yet) is covered by test_l3b below instead.
+        d = int(day_idx[idx])
+        if d in checked_days:
+            continue  # one representative bar per day is enough -- within a day, every
+            # before-close bar shares the same broadcast value, so this is exhaustive
+            # over days, not a sample of bars.
+        checked_days.add(d)
+        assert _l1_holds(feature_name, fixture_bars, int(idx)), (
+            f"{feature_name} at bar index {idx} (trading day {days[d]}, before that "
+            "day's own session window closed) changed value when more of that same "
+            "day's own bars were appended -- a same-day leak"
+        )
+
+
+@pytest.mark.parametrize("feature_name", _SESSION_TERMINAL_NAMES)
+def test_l3b_session_terminal_null_at_true_start_of_history(feature_name: str, fixture_bars: pl.DataFrame):
+    """The one case D-073 leaves genuinely, unconditionally null: before
+    the very FIRST trading day's own session has closed, there is no
+    earlier day's value to fall back to at all -- this is the residual
+    nulling guarantee (WP-020/D-073 restated it as "null only when no
+    session instance has ever completed yet")."""
     from jarvis.features.base import session_window_bounds, trading_day_boundaries
 
     defn = REGISTRY[feature_name]
@@ -171,14 +232,13 @@ def test_l3_session_terminal_nulling(feature_name: str, fixture_bars: pl.DataFra
     days, day_idx = trading_day_boundaries(fixture_bars)
     _starts, ends = session_window_bounds(_SESSION_SET, session_name, days)
     ts = fixture_bars["ts_utc_ns"].to_numpy()
-    window_end = ends[day_idx]
-    before_close = ts < window_end
 
-    before_df = result.filter(pl.Series(before_close))
-    assert before_df.height > 0  # the fixture must actually cover a pre-close bar
+    first_day_before_close = (day_idx == 0) & (ts < ends[0])
+    before_df = result.filter(pl.Series(first_day_before_close))
+    assert before_df.height > 0  # the fixture must actually start before day 0's own close
     assert before_df[feature_name].null_count() == before_df.height, (
-        f"{feature_name} is non-null before its session window closed on at "
-        "least one bar in the fixture"
+        f"{feature_name} is non-null before the very first trading day's own session "
+        "closed, with no prior day in the fixture at all to legitimately draw from"
     )
 
 

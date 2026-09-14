@@ -1,9 +1,12 @@
 """The Stage 0 feature library: atr_bars, pre_london_{high,low,range},
-pre_london_range_pct, rv_60m. Six registry entries implementing the five
-features named in WP-007 (pre_london_high/low/range are grouped as one
-feature concept in the WP's framing but are three separate FeatureDefs,
-since each has its own name and its own null/leakage behaviour to
-verify independently).
+pre_london_range_pct, rv_60m, and (WP-020, for R1) london_{high,low,range}
+and new_york_{high,low,range}. pre_london_high/low/range are grouped as
+one feature concept in WP-007's framing but are three separate
+FeatureDefs, since each has its own name and its own null/leakage
+behaviour to verify independently; london/new_york's own high/low/range
+triples follow the identical shape, sharing the same underlying
+session-generic compute functions parameterized by `params["session"]`
+(D-069/WP-020) rather than being copy-pasted per session.
 
 Every session_terminal feature here returns the EVENTUAL per-trading-day
 value broadcast to every bar of that day -- visibility (nulling before
@@ -105,18 +108,28 @@ register(
 
 
 # ---------------------------------------------------------------------------
-# pre_london_high / pre_london_low (session_terminal)
+# {session}_high / {session}_low (session_terminal) -- session-generic
+# since WP-020/D-069: the math was already parameterized by
+# params["session"]; only the internal Series label was ever hardcoded to
+# pre_london, and compute()'s own `.alias(name)` (features/compute.py)
+# overwrites that label unconditionally before it is ever exposed or read
+# by anything downstream (apply_session_terminal_mask takes session_name
+# as its own explicit argument, never from the Series). So the pre-WP-020
+# hardcoding was cosmetic, not a functional defect -- fixed anyway, since
+# a Series correctly labelled for the session it was actually computed
+# over is simply correct, and leaving it wrong is a landmine for any
+# future caller that doesn't go through compute()'s re-aliasing.
 # ---------------------------------------------------------------------------
 
 
-def _pre_london_extreme_compute(ctx: FeatureContext, *, which: str) -> pl.Series:
+def _session_extreme_compute(ctx: FeatureContext, *, which: str) -> pl.Series:
     """The eventual high or low of `mid` over the named session's window,
     per trading day, broadcast to every bar of that day. A trading day
     with no bars inside the window (market closed, or a hole) gets null
     for the whole day -- never a partial-window estimate."""
     bars = ctx.bars
     session_name = str(ctx.params["session"])
-    name = "pre_london_high" if which == "high" else "pre_london_low"
+    name = f"{session_name}_{which}"
 
     days, day_idx = trading_day_boundaries(bars)
     if not days:
@@ -151,11 +164,27 @@ def _pre_london_extreme_compute(ctx: FeatureContext, *, which: str) -> pl.Series
 
 
 def pre_london_high_compute(ctx: FeatureContext) -> pl.Series:
-    return _pre_london_extreme_compute(ctx, which="high")
+    return _session_extreme_compute(ctx, which="high")
 
 
 def pre_london_low_compute(ctx: FeatureContext) -> pl.Series:
-    return _pre_london_extreme_compute(ctx, which="low")
+    return _session_extreme_compute(ctx, which="low")
+
+
+def london_high_compute(ctx: FeatureContext) -> pl.Series:
+    return _session_extreme_compute(ctx, which="high")
+
+
+def london_low_compute(ctx: FeatureContext) -> pl.Series:
+    return _session_extreme_compute(ctx, which="low")
+
+
+def new_york_high_compute(ctx: FeatureContext) -> pl.Series:
+    return _session_extreme_compute(ctx, which="high")
+
+
+def new_york_low_compute(ctx: FeatureContext) -> pl.Series:
+    return _session_extreme_compute(ctx, which="low")
 
 
 register(
@@ -186,16 +215,81 @@ register(
     )
 )
 
+register(
+    FeatureDef(
+        name="london_high",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=(),
+        params={"session": "london"},
+        leakage_class="session_terminal",
+        compute=london_high_compute,
+    )
+)
+
+register(
+    FeatureDef(
+        name="london_low",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=(),
+        params={"session": "london"},
+        leakage_class="session_terminal",
+        compute=london_low_compute,
+    )
+)
+
+register(
+    FeatureDef(
+        name="new_york_high",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=(),
+        params={"session": "new_york"},
+        leakage_class="session_terminal",
+        compute=new_york_high_compute,
+    )
+)
+
+register(
+    FeatureDef(
+        name="new_york_low",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=(),
+        params={"session": "new_york"},
+        leakage_class="session_terminal",
+        compute=new_york_low_compute,
+    )
+)
+
 
 # ---------------------------------------------------------------------------
-# pre_london_range (session_terminal)
+# {session}_range (session_terminal) -- session-generic since WP-020,
+# unlike the extreme functions above, this one previously hardcoded real
+# behaviour (the ctx.computed[...] dict-key lookups), not just a cosmetic
+# label -- a london_range FeatureDef pointed at the old, unparameterized
+# function would have silently read pre_london's high/low. Fixed by
+# deriving both the lookup keys and the output name from
+# params["session"], which reproduces pre_london_range's exact prior
+# behaviour for session="pre_london" (the naming convention already
+# matched: "pre_london" + "_high"/"_low"/"_range").
 # ---------------------------------------------------------------------------
 
 
-def pre_london_range_compute(ctx: FeatureContext) -> pl.Series:
-    high = ctx.computed["pre_london_high"]
-    low = ctx.computed["pre_london_low"]
-    return (high - low).alias("pre_london_range")
+def _session_range_compute(ctx: FeatureContext) -> pl.Series:
+    session_name = str(ctx.params["session"])
+    high = ctx.computed[f"{session_name}_high"]
+    low = ctx.computed[f"{session_name}_low"]
+    return (high - low).alias(f"{session_name}_range")
 
 
 register(
@@ -208,7 +302,35 @@ register(
         requires=("pre_london_high", "pre_london_low"),
         params={"session": "pre_london"},
         leakage_class="session_terminal",
-        compute=pre_london_range_compute,
+        compute=_session_range_compute,
+    )
+)
+
+register(
+    FeatureDef(
+        name="london_range",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=("london_high", "london_low"),
+        params={"session": "london"},
+        leakage_class="session_terminal",
+        compute=_session_range_compute,
+    )
+)
+
+register(
+    FeatureDef(
+        name="new_york_range",
+        version=1,
+        dtype=pl.Float64,
+        lookback=LookbackSpec("sessions", 1),
+        gap_tolerance_ns=None,
+        requires=("new_york_high", "new_york_low"),
+        params={"session": "new_york"},
+        leakage_class="session_terminal",
+        compute=_session_range_compute,
     )
 )
 
@@ -230,15 +352,29 @@ def pre_london_range_pct_compute(ctx: FeatureContext) -> pl.Series:
     current range does not count as "exceeded" -- ties are conservative,
     not treated as evidence of a new extreme.
 
-    ctx.computed["pre_london_range"] arrives already session_terminal-
-    masked (null before window close, constant for the rest of the day).
-    Reading "today's own value" from a masked series is still correct:
-    once window close has passed for a given day, that day's value is a
-    single non-null constant for the remainder of the day, so
-    drop_nulls().first() per day recovers it regardless of the mask.
+    WP-020/D-073: `ctx.computed["pre_london_range"]` arrives already
+    session_terminal-masked under the "most recently completed instance"
+    semantic -- a day's EARLY bars can now legitimately show a PRIOR
+    day's already-completed value (D-073), not just null. "First non-null
+    bar of the day" therefore no longer safely identifies "this day's own
+    value" -- it would pick up yesterday's carried-forward value instead.
+    Two things are extracted independently rather than inferred from the
+    mask's own null/non-null transition: (1) whether day D had any bars
+    in its OWN window at all (`day_has_own_bars`, computed directly from
+    `bars`' timestamps against that day's own window bounds -- the same
+    inputs `_session_extreme_compute` uses, never the masked series) --
+    this alone decides eligibility, exactly reproducing the original
+    "no bars this day -> skip entirely" rule; (2) for an eligible day,
+    its own value is read from the masked series at the first bar AT OR
+    AFTER that day's own independently-computed window-close instant
+    (`session_window_bounds`) -- by construction the mask has already
+    revealed day D's own value there (D-073's "own_day_closed" case), so
+    this anchor is correct regardless of what the masking semantic does
+    on either side of it.
     """
     bars = ctx.bars
     n = int(ctx.params["n"])
+    session_name = str(ctx.params["session"])
     range_series = ctx.computed["pre_london_range"]
 
     days, day_idx = trading_day_boundaries(bars)
@@ -246,17 +382,26 @@ def pre_london_range_pct_compute(ctx: FeatureContext) -> pl.Series:
     if not days:
         return pl.Series(name, [], dtype=pl.Float64)
 
-    per_day = (
-        pl.DataFrame({"_day_idx": day_idx, "_range": range_series})
-        .group_by("_day_idx", maintain_order=True)
-        .agg(pl.col("_range").drop_nulls().first().alias("_value"))
-    )
-
     n_days = len(days)
+    starts, ends = session_window_bounds(ctx.session_set, session_name, days)
+    ts = bars["ts_utc_ns"].to_numpy()
+    range_arr = range_series.to_numpy()
+
+    bar_window_start = starts[day_idx]
+    bar_window_end = ends[day_idx]
+    in_own_window = (ts >= bar_window_start) & (ts < bar_window_end)
+    day_has_own_bars = np.zeros(n_days, dtype=bool)
+    day_has_own_bars[day_idx[in_own_window]] = True
+
+    close_bar_idx = np.searchsorted(ts, ends, side="left")
     day_value = np.full(n_days, np.nan, dtype=np.float64)
-    idx_present = per_day["_day_idx"].to_numpy()
-    vals_present = per_day["_value"].to_numpy()
-    day_value[idx_present] = vals_present
+    for d in range(n_days):
+        if not day_has_own_bars[d]:
+            continue  # no bars in this day's own window -> not eligible, per the docstring's rule
+        idx = close_bar_idx[d]
+        if idx >= len(ts):
+            continue  # this day's own window closes after the last bar in this frame -- not yet observable
+        day_value[d] = range_arr[idx]
 
     eligible_mask = ~np.isnan(day_value)
     eligible_day_indices = np.nonzero(eligible_mask)[0]
