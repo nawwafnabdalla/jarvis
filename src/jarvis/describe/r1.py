@@ -156,9 +156,22 @@ def _compute_session(
 
     starts, ends = session_window_bounds(session_set, session, days)
     day_range, day_atr = _extract_day_values(bars, days, day_idx, range_series, atr_series, starts, ends)
-    day_atr_ratio = day_range / day_atr  # ATR-unit range; NaN propagates through NaN/0 harmlessly
+    # ATR-unit range. day_atr is NaN wherever the day is ineligible or ATR's
+    # own warmup hasn't completed (numpy: NaN/x and x/NaN are both NaN,
+    # caught by isnan). An exact day_atr == 0.0 has never been observed
+    # against the real dataset (checked directly, not assumed -- overnight
+    # audit, 2026-09-15) but is not provably impossible, and numpy gives
+    # +-inf for a nonzero/0.0 division, which isnan alone does NOT catch --
+    # np.isfinite excludes NaN and +-inf together, so a zero-ATR day is
+    # excluded the same way a NaN one already is, rather than silently
+    # surviving as an infinite ratio. Division by exactly 0.0 (or 0.0/0.0)
+    # is anticipated and handled by the isfinite mask below, not an actual
+    # error -- suppressed here rather than left to print a numpy warning
+    # on every such day.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        day_atr_ratio = day_range / day_atr
 
-    valid = ~np.isnan(day_range) & ~np.isnan(day_atr_ratio)
+    valid = ~np.isnan(day_range) & np.isfinite(day_atr_ratio)
 
     # Deterministic per-session offset for seed derivation -- NOT Python's
     # built-in hash() on a string, which is randomised per-process by

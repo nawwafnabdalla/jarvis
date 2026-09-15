@@ -1,11 +1,11 @@
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import numpy as np
 import polars as pl
 import pytest
 
 from jarvis.core.types import Nanos
-from jarvis.describe.r1 import SESSIONS, compute_r1
+from jarvis.describe.r1 import SESSIONS, _extract_day_values, _stats_for, compute_r1
 from jarvis.sessions import load_session_set
 
 SESSION_SET = load_session_set("fx_core", 1)
@@ -143,3 +143,94 @@ def test_below_min_n_has_no_bootstrap_ci():
         for yc in sess.by_year:
             assert yc.stats.median_price is None
             assert yc.stats.median_atr is None
+
+
+def _flat_bid_fluctuating_ask_bars(n_weekdays: int, *, start: datetime, fluctuate_on_day: int) -> pl.DataFrame:
+    """bid is bit-for-bit IDENTICAL on every bar in the whole fixture, so
+    true_range (bid-only, Bible F.3 #3) is exactly 0 on every bar and
+    atr_bars(1440) is exactly 0.0 from its warmup bar onward, forever.
+    ask alternates on exactly one target trading day (0-indexed), so
+    mid = (bid_c+ask_c)/2 -- and therefore that day's session range -- is
+    genuinely nonzero on that day despite atr_bars being exactly 0.0 there:
+    the day_range>0, day_atr==0.0-exactly scenario the isinf fix protects
+    against, constructed directly rather than hoped for."""
+    rows = []
+    day = start
+    added = 0
+    day_num = 0
+    while added < n_weekdays:
+        if day.weekday() < 5:
+            for m in range(24 * 60):
+                ts = Nanos(int(day.timestamp()) * 1_000_000_000 + m * NS_PER_MINUTE)
+                bid = 1.3000  # bit-identical every bar, every day -- true_range stays exactly 0
+                if day_num == fluctuate_on_day:
+                    ask = 1.3002 if m % 2 == 0 else 1.3010
+                else:
+                    ask = 1.3002
+                rows.append(
+                    {
+                        "ts_utc_ns": ts, "bid_o": bid, "bid_h": bid, "bid_l": bid, "bid_c": bid,
+                        "ask_o": ask, "ask_h": ask, "ask_l": ask, "ask_c": ask,
+                        "tick_count": 1, "first_tick_ns": ts, "last_tick_ns": ts,
+                        "spread_open": ask - bid, "spread_max": ask - bid, "spread_twa": ask - bid,
+                        "prev_gap_ns": None,
+                    }
+                )
+            added += 1
+            day_num += 1
+        day = datetime.fromtimestamp(day.timestamp() + 86400, tz=timezone.utc)
+    return pl.DataFrame(rows)
+
+
+def test_exact_zero_atr_day_excluded_not_infinite():
+    # Day 0 (Monday) is pure warmup for atr_bars(1440) -- flat throughout.
+    # Day 1 (Tuesday) has a genuinely nonzero pre_london range (ask
+    # fluctuates) while atr_bars is still exactly 0.0 there (bid never
+    # moves, anywhere in the fixture). Before the isinf fix, this day's
+    # ATR-unit ratio would have been +inf and silently included.
+    bars = _flat_bid_fluctuating_ask_bars(4, start=datetime(2010, 1, 4, tzinfo=timezone.utc), fluctuate_on_day=1)
+    result = compute_r1(bars, SESSION_SET, start_ns=Nanos(0), end_ns=Nanos(1))
+
+    pre_london = next(s for s in result.sessions if s.session == "pre_london")
+    for yc in pre_london.by_year:
+        for v in yc.raw_atr_values:
+            assert np.isfinite(v), f"non-finite ATR-unit value leaked into R1's output: {v}"
+        if yc.stats.median_atr is not None:
+            assert np.isfinite(yc.stats.median_atr.point_estimate)
+            assert np.isfinite(yc.stats.median_atr.ci_low)
+            assert np.isfinite(yc.stats.median_atr.ci_high)
+
+
+def test_extract_day_values_excludes_day_whose_close_is_beyond_the_last_bar():
+    # Coverage gap found by tonight's targeted coverage sweep: day 1's own
+    # window has real bars in it (day_has_own_bars=True) but its own
+    # close falls after the very last bar in this frame -- "not yet
+    # observable," a real edge case (a session that closes after the data
+    # feed's own cutoff) distinct from "no bars this day at all," and
+    # previously untested.
+    bars = pl.DataFrame({"ts_utc_ns": [0, 10, 20, 30, 100, 110, 120, 130]})
+    range_series = pl.Series("r", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+    atr_series = pl.Series("a", [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0])
+    days = [date(2020, 1, 1), date(2020, 1, 2)]
+    day_idx = np.array([0, 0, 0, 0, 1, 1, 1, 1])
+    starts = np.array([0, 100])
+    ends = np.array([25, 500])  # day 1's close (500) is beyond the last bar (ts=130)
+
+    day_range, day_atr = _extract_day_values(bars, days, day_idx, range_series, atr_series, starts, ends)
+
+    assert day_range[0] == 4.0 and day_atr[0] == 40.0  # day 0: closes within the frame, observable
+    assert np.isnan(day_range[1]) and np.isnan(day_atr[1])  # day 1: has bars, but close not yet observable
+
+
+def test_stats_for_empty_arrays_returns_all_none():
+    # _stats_for's own n==0 branch, tested directly regardless of whether
+    # the current single call site in _compute_session ever reaches it
+    # (it only iterates years/weekdays already known to have >=1 valid
+    # day) -- the function's own contract on its documented edge case.
+    stats = _stats_for(np.array([]), np.array([]), seed=1)
+    assert stats.n == 0
+    assert stats.median_price is None and stats.median_atr is None
+    assert stats.q1_price is None and stats.q3_price is None
+    assert stats.q1_atr is None and stats.q3_atr is None
+
+

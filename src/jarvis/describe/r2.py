@@ -218,8 +218,18 @@ def compute_r2(bars: pl.DataFrame, session_set: SessionSet, *, start_ns: Nanos, 
         bars, days, day_idx, [result.frame["pre_london_range_pct"]], pre_london_starts, pre_london_ends
     )
 
-    day_ratio = day_range / day_atr  # NaN propagates through NaN/0 harmlessly (same as R1's day_atr_ratio)
-    valid = ~np.isnan(day_ratio) & ~np.isnan(day_pct)
+    # day_atr is NaN wherever the day is ineligible or ATR's own warmup
+    # hasn't completed (numpy: NaN/x and x/NaN are both NaN). An exact
+    # day_atr == 0.0 has never been observed against the real dataset
+    # (checked directly, overnight audit 2026-09-15) but is not provably
+    # impossible, and numpy gives +-inf for nonzero/0.0, which isnan alone
+    # does not catch -- np.isfinite excludes NaN and +-inf together, same
+    # reasoning and fix as R1's day_atr_ratio. Suppressed rather than left
+    # to warn -- the division-by-zero/NaN case is anticipated and handled
+    # by the isfinite mask below, not an actual error.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        day_ratio = day_range / day_atr
+    valid = np.isfinite(day_ratio) & ~np.isnan(day_pct)
 
     eligible_indices = np.nonzero(valid)[0]
     if eligible_indices.size == 0:

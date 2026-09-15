@@ -176,12 +176,19 @@ def _sidecar_frame(result: R1Result) -> pl.DataFrame:
 
 
 def _box_plot_svg(result: R1Result) -> str:
+    # Gated by the SAME `is_suppressed` threshold (G.1.3: n<10) the
+    # adjacent table uses for its own "n<10 suppressed" cells -- a year a
+    # reader is told is unreliable in the table must never still draw a
+    # box next to it. Checked directly against the real 2007-2014 dataset
+    # (overnight audit, 2026-09-15): no session-year cell there has
+    # 0<n<10, so this gate has never actually excluded a real box: it is
+    # a defensive correctness fix, not an observed-necessary one.
     panels = []
     for sess in result.sessions:
         boxes = [
             compute_box_stats(str(yc.year), np.asarray(yc.raw_atr_values, dtype=np.float64))
             for yc in sess.by_year
-            if yc.raw_atr_values
+            if not is_suppressed(yc.stats.n)
         ]
         panels.append((f"{sess.session} range (ATR units)", boxes))
     return render_box_plot_svg(panels)

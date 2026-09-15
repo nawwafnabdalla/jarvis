@@ -4,9 +4,10 @@ import numpy as np
 import polars as pl
 import pytest
 
+from jarvis.core.bootstrap import BootstrapCI
 from jarvis.core.types import Nanos
-from jarvis.describe.r5 import compute_r5
-from jarvis.reporting.describe_r5 import render_r5_markdown, write_r5_report
+from jarvis.describe.r5 import HourOfWeekRow, R5Result, compute_r5
+from jarvis.reporting.describe_r5 import _fmt_ci, render_r5_markdown, write_r5_report
 from jarvis.reporting.furniture import WATERMARK
 
 
@@ -99,6 +100,36 @@ def test_suppressed_row_shows_the_exact_g13_text(tmp_path):
     assert "n<10 suppressed" in md
 
 
+def test_divergent_spread_and_range_n_render_both_distinctly(tmp_path):
+    # spread n=100, range_60m_ci's own n=80 -- a real, checked-possible
+    # divergence (60-bar rolling-window warmup drops its own nulls
+    # separately from the spread sample), previously invisible because
+    # the table showed only one `n`.
+    spread_ci = BootstrapCI(point_estimate=0.0003, ci_low=0.00028, ci_high=0.00032, n=100, confidence=0.95, n_resamples=500)
+    range_ci = BootstrapCI(point_estimate=0.001, ci_low=0.0009, ci_high=0.0011, n=80, confidence=0.95, n_resamples=500)
+    divergent_row = HourOfWeekRow(
+        weekday=1, hour=9, n=100, spread_ci=spread_ci, range_60m_ci=range_ci, spread_to_range_ratio=0.3
+    )
+    matching_row = HourOfWeekRow(
+        weekday=1, hour=10, n=100, spread_ci=spread_ci,
+        range_60m_ci=BootstrapCI(point_estimate=0.001, ci_low=0.0009, ci_high=0.0011, n=100, confidence=0.95, n_resamples=500),
+        spread_to_range_ratio=0.3,
+    )
+    result = R5Result(
+        start_ns=Nanos(0), end_ns=Nanos(1), bars_examined=1000,
+        by_hour_of_week=(divergent_row, matching_row), by_year=(),
+    )
+    md = render_r5_markdown(result, repo_root=tmp_path)
+    assert "range n=80" in md and "spread n=100" in md
+
+    lines = [l for l in md.splitlines() if l.startswith("| Mon |")]
+    assert len(lines) == 2
+    divergent_line = next(l for l in lines if "09:00" in l)
+    matching_line = next(l for l in lines if "10:00" in l)
+    assert "range n=80" in divergent_line
+    assert "range n=" not in matching_line
+
+
 def test_write_r5_report_writes_real_files(real_result, tmp_path):
     md_path, parquet_path = write_r5_report(tmp_path, real_result)
     assert md_path.is_file()
@@ -115,3 +146,7 @@ def test_parquet_sidecar_has_one_row_per_hour_of_week_bucket(real_result, tmp_pa
     assert sidecar.height == len(real_result.by_hour_of_week)
     assert "weekday" in sidecar.columns
     assert "spread_to_range_ratio" in sidecar.columns
+
+
+def test_fmt_ci_renders_placeholder_for_none():
+    assert _fmt_ci(None) == "--"

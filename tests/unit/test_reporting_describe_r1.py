@@ -1,11 +1,14 @@
 from datetime import datetime, timezone
 
+import numpy as np
 import polars as pl
 import pytest
 
+from jarvis.core.bootstrap import BootstrapCI
 from jarvis.core.types import Nanos
-from jarvis.describe.r1 import compute_r1
-from jarvis.reporting.describe_r1 import render_r1_markdown, write_r1_report
+from jarvis.describe.r1 import R1Result, RangeStats, SessionResult, YearCell, compute_r1
+from jarvis.reporting.boxplot import compute_box_stats, render_box_plot_svg
+from jarvis.reporting.describe_r1 import _box_plot_svg, _fmt_ci, _fmt_iqr, render_r1_markdown, write_r1_report
 from jarvis.reporting.furniture import WATERMARK
 from jarvis.sessions import load_session_set
 
@@ -102,3 +105,52 @@ def test_svg_sidecar_has_three_panels(real_result, tmp_path):
     svg_text = svg_path.read_text(encoding="utf-8")
     for session in ("pre_london", "london", "new_york"):
         assert session in svg_text
+
+
+def _stats(n: int) -> RangeStats:
+    if n == 0:
+        return RangeStats(n=0, median_price=None, median_atr=None, q1_price=None, q3_price=None, q1_atr=None, q3_atr=None)
+    ci = BootstrapCI(point_estimate=1.0, ci_low=0.9, ci_high=1.1, n=n, confidence=0.95, n_resamples=100)
+    return RangeStats(n=n, median_price=ci, median_atr=ci, q1_price=0.5, q3_price=1.5, q1_atr=0.5, q3_atr=1.5)
+
+
+def test_box_plot_excludes_a_year_the_table_would_suppress():
+    # A year with n=5 (below G.1.3's n<10 suppression floor -- the table
+    # would render it "n<10 suppressed") must not still draw a box next
+    # to a table that calls it unreliable. A year with n=15 (above the
+    # floor) must still appear normally.
+    suppressed_year = YearCell(year=2007, stats=_stats(5), raw_atr_values=tuple(float(i) for i in range(5)))
+    normal_year = YearCell(year=2008, stats=_stats(15), raw_atr_values=tuple(float(i) for i in range(15)))
+    result = R1Result(
+        start_ns=Nanos(0),
+        end_ns=Nanos(1),
+        bars_examined=100,
+        sessions=(
+            SessionResult(session="pre_london", by_year=(suppressed_year, normal_year), by_weekday=()),
+        ),
+    )
+    svg = _box_plot_svg(result)
+    assert "2008" in svg
+    assert "2007" not in svg
+
+
+def test_fmt_ci_renders_placeholder_for_none():
+    assert _fmt_ci(None) == "--"
+
+
+def test_fmt_iqr_renders_placeholder_for_none():
+    assert _fmt_iqr(None, None) == "--"
+    assert _fmt_iqr(0.1, None) == "--"
+
+
+def test_box_plot_handles_perfectly_flat_data_without_dividing_by_zero():
+    # boxplot.py's own y_min==y_max guard (protects the later
+    # (v-y_min)/(y_max-y_min) scaling division from a zero denominator)
+    # -- already present in the code, but no existing test (all of which
+    # use real or randomly-noised fixtures) had ever actually exercised
+    # perfectly identical values across a whole panel. Confirmed the
+    # guard genuinely works, not just that it reads plausibly.
+    flat_box = compute_box_stats("2020", np.array([5.0, 5.0, 5.0, 5.0, 5.0]))
+    svg = render_box_plot_svg([("flat panel", [flat_box])])
+    assert "<svg" in svg and svg.strip().endswith("</svg>")
+    assert "nan" not in svg.lower() and "inf" not in svg.lower()

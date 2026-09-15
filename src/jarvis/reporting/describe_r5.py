@@ -34,6 +34,21 @@ def _fmt_ci(ci) -> str:
     return f"{ci.point_estimate:.6f} [{ci.ci_low:.6f}, {ci.ci_high:.6f}]"
 
 
+def _range_n_divergence_note(row) -> str:
+    """The `n` column is the spread sample's own count; `range_60m_ci`
+    drops its own nulls separately (a 60-bar rolling-window warmup, per
+    `_add_derived_columns`), so its actual sample size can differ from
+    the displayed `n` without anything disclosing it -- checked directly
+    against the real 2007-2014 dataset (overnight audit, 2026-09-15): the
+    gap is real but tiny (max 42 of ~22,890 rows, 0.18%, confined to the
+    dataset's first calendar hour). Surfaced here whenever it occurs,
+    rather than left implicit in a column whose name doesn't say which
+    of the two statistics it actually counts."""
+    if row.range_60m_ci is None or row.range_60m_ci.n == row.n:
+        return ""
+    return f"range n={row.range_60m_ci.n} (spread n={row.n})"
+
+
 def _actual_bootstrap_params(result: R5Result) -> tuple[float, int] | None:
     """Reads (confidence, n_resamples) from whatever this specific run's
     own `BootstrapCI` objects actually recorded, rather than a hardcoded
@@ -88,7 +103,12 @@ def render_r5_markdown(result: R5Result, *, repo_root: Path) -> str:
         "",
         "## Spread and 60-minute range by hour-of-week",
         "",
-        "| Weekday | Hour (London) | n | Median spread [95% CI] | Median 60m range [95% CI] | Spread/range ratio | Note |",
+        "`n` counts the spread sample; the 60-minute range sample drops its own "
+        "nulls separately (a 60-bar rolling-window warmup) and can differ -- "
+        "the Note column states both counts explicitly whenever they diverge "
+        "for a cell, rather than only showing one.",
+        "",
+        "| Weekday | Hour (London) | n (spread) | Median spread [95% CI] | Median 60m range [95% CI] | Spread/range ratio | Note |",
         "|---|---|---|---|---|---|---|",
     ]
     for row in result.by_hour_of_week:
@@ -99,10 +119,11 @@ def render_r5_markdown(result: R5Result, *, repo_root: Path) -> str:
             )
             continue
         ratio_str = f"{row.spread_to_range_ratio:.6f}" if row.spread_to_range_ratio is not None else "--"
+        notes = [n for n in (sample_size_note(row.n), _range_n_divergence_note(row)) if n]
         lines.append(
             f"| {_WEEKDAY_NAMES[row.weekday]} | {row.hour:02d}:00 | {row.n} | "
             f"{_fmt_ci(row.spread_ci)} | {_fmt_ci(row.range_60m_ci)} | {ratio_str} | "
-            f"{sample_size_note(row.n)} |"
+            f"{'; '.join(notes)} |"
         )
 
     lines += [

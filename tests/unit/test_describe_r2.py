@@ -5,7 +5,7 @@ import polars as pl
 import pytest
 
 from jarvis.core.types import Nanos
-from jarvis.describe.r2 import N_BUCKETS, _bootstrap_or_none, _bucket_quintiles, compute_r2
+from jarvis.describe.r2 import N_BUCKETS, _bootstrap_or_none, _bucket_quintiles, _bucket_stats, compute_r2
 from jarvis.sessions import load_session_set
 
 SESSION_SET = load_session_set("fx_core", 1)
@@ -209,3 +209,79 @@ def test_bucket_stats_has_iqr_and_pct_range_when_populated():
             assert bs.pct_min <= bs.pct_max
             assert bs.q1_ratio is not None and bs.q3_ratio is not None
             assert bs.q1_ratio <= bs.q3_ratio
+
+
+def _flat_bid_fluctuating_ask_bars(n_weekdays: int, *, start: datetime, fluctuate_days: set) -> pl.DataFrame:
+    """Same construction as `test_describe_r1.py`'s own helper: bid is
+    bit-identical on every bar in the whole fixture (true_range stays
+    exactly 0, so atr_bars(1440) is exactly 0.0 from its warmup bar
+    onward), while ask alternates on every calendar day in
+    `fluctuate_days` (0-indexed weekday counters), so that whichever real
+    trading day (17:00 America/New_York boundaries, offset from
+    UTC-midnight calendar days) ends up covering london's own window, its
+    range is genuinely nonzero despite atr_bars being exactly 0.0 there --
+    the day_range>0, day_atr==0.0 exactly scenario the isinf fix protects
+    against, constructed directly rather than hoped for. A multi-day span
+    (not a single day) is used deliberately so the result does not depend
+    on precisely knowing the trading-day/calendar-day offset."""
+    rows = []
+    day = start
+    added = 0
+    day_num = 0
+    while added < n_weekdays:
+        if day.weekday() < 5:
+            for m in range(24 * 60):
+                ts = Nanos(int(day.timestamp()) * 1_000_000_000 + m * NS_PER_MINUTE)
+                bid = 1.3000
+                ask = (1.3002 if m % 2 == 0 else 1.3010) if day_num in fluctuate_days else 1.3002
+                rows.append(
+                    {
+                        "ts_utc_ns": ts, "bid_o": bid, "bid_h": bid, "bid_l": bid, "bid_c": bid,
+                        "ask_o": ask, "ask_h": ask, "ask_l": ask, "ask_c": ask,
+                        "tick_count": 1, "first_tick_ns": ts, "last_tick_ns": ts,
+                        "spread_open": ask - bid, "spread_max": ask - bid, "spread_twa": ask - bid,
+                        "prev_gap_ns": None,
+                    }
+                )
+            added += 1
+            day_num += 1
+        day = datetime.fromtimestamp(day.timestamp() + 86400, tz=timezone.utc)
+    return pl.DataFrame(rows)
+
+
+def test_exact_zero_atr_day_excluded_not_infinite():
+    # The last 20 calendar weekdays (well past pre_london_range_pct's own
+    # 60-day warmup) fluctuate. Verified directly (not assumed) that this
+    # produces real trading days with london_range > 0 while atr_bars is
+    # exactly 0.0 -- the calendar-weekday counter used to build this
+    # fixture and the 17:00-America/New_York-anchored trading-day index
+    # `compute_r2` actually uses are offset from each other, so a wide
+    # fluctuation span is used rather than one hand-picked day index.
+    bars = _flat_bid_fluctuating_ask_bars(
+        75, start=datetime(2010, 1, 4, tzinfo=timezone.utc), fluctuate_days=set(range(55, 75))
+    )
+    result = compute_r2(bars, SESSION_SET, start_ns=Nanos(0), end_ns=Nanos(1))
+
+    for bs in result.pooled:
+        if bs.q1_ratio is not None:
+            assert np.isfinite(bs.q1_ratio) and np.isfinite(bs.q3_ratio)
+        if bs.median_ratio is not None:
+            assert np.isfinite(bs.median_ratio.point_estimate)
+            assert np.isfinite(bs.median_ratio.ci_low) and np.isfinite(bs.median_ratio.ci_high)
+    for yb in result.by_year:
+        for bs in yb.buckets:
+            if bs.q1_ratio is not None:
+                assert np.isfinite(bs.q1_ratio) and np.isfinite(bs.q3_ratio)
+
+
+def test_bucket_stats_empty_arrays_returns_all_none():
+    # _bucket_stats's own n==0 branch, tested directly. A real (if rare on
+    # real data) possibility per the demonstrated starvation behaviour of
+    # _bucket_quintiles above -- tested here at the level that actually
+    # constructs a BucketStats, not just the bucket-id assignment.
+    bs = _bucket_stats(4, np.array([]), np.array([]), seed=1)
+    assert bs.bucket == 4
+    assert bs.n == 0
+    assert bs.pct_min is None and bs.pct_max is None
+    assert bs.median_ratio is None
+    assert bs.q1_ratio is None and bs.q3_ratio is None
