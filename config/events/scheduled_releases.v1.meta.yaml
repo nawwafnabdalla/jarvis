@@ -1,0 +1,99 @@
+# Scheduled economic-release calendar (Technical Bible AR-4, D-014, Product
+# Bible Y3). Immutable once referenced, the same convention as
+# config/sessions/*.yaml: a correction is a new v{n+1} file, never an edit
+# to this one.
+#
+# Purpose: an exclusion flag and robustness-segmentation input ("does a
+# result survive removing scheduled-event days?") -- never a predictive
+# feature, never conditioned on for anything but flagging a day. This file
+# and its loader (jarvis.events.calendar) do not decide whether any
+# existing report should USE this flag; building the calendar and exposing
+# it is infrastructure, not a change to what any report currently says
+# about the data (WP-022's own scope boundary).
+#
+# No live dependency: this is a static, one-time-compiled, checked-in
+# file. The loader (jarvis.events.calendar.load_scheduled_releases) reads
+# only this file from disk -- no network call, no API key, no scraping, at
+# load time or any other time. D-014's offline-by-default requirement.
+
+calendar_id: scheduled_releases
+version: 1
+instrument_scope: GBPUSD
+date_range:
+  start: "2007-01-01"
+  end: "2014-12-31"
+  note: >
+    Covers Stage 2's fixed descriptive range (2007-2014, AR-1) exactly,
+    the minimum WP-022 required. Not extended to the full 2007-2022
+    ingest range in this version -- doing so is no harder in principle,
+    just additional compilation and verification effort not needed for
+    any currently-authorised use; a v2 file can extend the range later
+    without touching this one.
+compiled_utc: "2026-09-15T05:00:00Z"
+
+event_types:
+  nfp:
+    label: "US Non-Farm Payrolls"
+    convention: "First Friday of the month, 08:30 America/New_York"
+    exceptions: >
+      Five documented exceptions in this range, none assumed from the
+      standard rule -- each verified directly against a BLS source
+      (https://www.bls.gov/bls/news-release/empsit.htm and individual
+      archived release PDFs), found by systematically checking every
+      month where the standard first-Friday date collides with a fixed
+      US federal holiday (New Year's Day, Independence Day -- the only
+      two fixed-date holidays that can fall within a month's first 7
+      days), not merely applying the rule blind:
+      (1) 2008-07: standard date 2008-07-04 is Independence Day; the
+      June 2008 report was released 2008-07-03 instead (bls.gov/news.
+      release/archives/empsit_07032008.pdf).
+      (2) 2010-01: standard date 2010-01-01 is New Year's Day; the
+      December 2009 report was released 2010-01-08 instead (the second
+      Friday, not the first).
+      (3) 2013-10: standard date 2013-10-04; the September 2013 report
+      was delayed to 2013-10-22 by the Oct 2013 government shutdown.
+      (4) 2013-11: standard date 2013-11-01; the October 2013 report
+      was delayed to 2013-11-08 by the same shutdown.
+      (5) 2014-07: standard date 2014-07-04 is Independence Day; the
+      June 2014 report was released 2014-07-03 instead (bls.gov/news.
+      release/archives/empsit_07032014.pdf).
+      All five dates in this file reflect the actual historical release
+      date, not the standard first-Friday date, and each row's own
+      source_note says so.
+    source: "Computed (first Friday of month is a fixed, deterministic rule with no ambiguity outside the five documented exceptions above, found by a systematic holiday-collision check, not by exhaustively verifying all 96 months against a primary source), cross-checked against bls.gov directly for all five exceptions."
+    confidence: "high for all 96 rows -- the rule itself is deterministic and unambiguous, and every calendar month where the rule could plausibly break (a fixed federal holiday landing in the first 7 days of the month, or the one known 2013 shutdown period) was individually checked against a primary bls.gov source rather than assumed exception-free."
+  fomc:
+    label: "FOMC scheduled rate decision"
+    convention: "Decision/statement day -- the 2nd day of a 2-day meeting where applicable, 14:15 America/New_York"
+    exceptions: >
+      Unscheduled intermeeting conference calls (emergency actions, most
+      concentrated in 2008's crisis period and occasional single-day
+      calls in other years) are DELIBERATELY EXCLUDED -- AR-4 scopes this
+      calendar to scheduled releases known in advance, not ad hoc events
+      discovered after the fact (the same distinction D-053/D-053a
+      already draws for market-history data-quality notes).
+    source: "Fetched and read directly from the Federal Reserve's own historical archive, one page per year: https://www.federalreserve.gov/monetarypolicy/fomchistorical{YYYY}.htm for YYYY in 2007..2014. Every row cross-referenced against that page's own 'Regular meeting' vs. 'Conference Call' labelling."
+    confidence: high
+  boe_mpc:
+    label: "Bank of England Monetary Policy Committee scheduled rate decision"
+    convention: "Announced 12:00 noon, the 2nd day (Thursday) of a 2-day meeting"
+    exceptions: "None documented in this range."
+    source: >
+      Fetched and read directly from bankofengland.co.uk's own official
+      press-release PDFs. 2008, 2011, 2012, 2013 and 2014 were each
+      verified against the CONFIRMED release for that specific year
+      (published ~3-4 months before the year began), not an earlier
+      PROVISIONAL announcement -- a real discrepancy was caught this way:
+      the provisional 2013 dates (published Sept 2011) gave July as
+      "Wed 5/Thu 6", but the confirmed 2013 release (published Sept
+      2012) gives "Wed 3/Thu 4" -- the confirmed date was used. 2007,
+      2009 and 2010 were cross-checked via a secondary aggregated
+      source rather than independently re-fetched from a primary PDF in
+      this pass; internally consistent (clean Wed/Thu adjacent-day
+      pattern matching every other year) but held to a slightly lower
+      confidence than the years fetched directly from a primary PDF.
+    confidence: "high (2008, 2011-2014, directly PDF-verified); medium (2007, 2009, 2010, secondary-source cross-checked, not independently re-fetched from a primary PDF in this compilation pass)"
+
+deliberately_excluded:
+  - "ECB rate decisions -- explicitly lower priority per WP-022's own instruction ('include if time allows, don't let it block the rest'); not included in v1. A v2 file can add them without touching this one."
+  - "Ad hoc / unscheduled market events (the Brexit referendum, the 2010 Flash Crash, the 2022 UK mini-budget, FOMC/BoE emergency intermeeting actions) -- AR-4's calendar is specifically for releases scheduled and publicly known in advance, not volatility events discovered after the fact. These are handled elsewhere in this project's data-quality notes (D-053/D-053a), not here -- mixing the two would blur a distinction the project has been careful about."

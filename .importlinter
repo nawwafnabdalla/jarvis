@@ -32,7 +32,7 @@ layers =
     jarvis.describe : jarvis.backtest : jarvis.statistics : jarvis.robustness : jarvis.forward : jarvis.probe
     jarvis.experiments : jarvis.vault
     jarvis.features : jarvis.strategies : jarvis.strategy_impls : jarvis.opportunities : jarvis.execution
-    jarvis.core : jarvis.provenance : jarvis.timeengine : jarvis.sessions : jarvis.ingest : jarvis.bars : jarvis.qa
+    jarvis.core : jarvis.provenance : jarvis.timeengine : jarvis.sessions : jarvis.events : jarvis.ingest : jarvis.bars : jarvis.qa
 
 # --- Purity rule (Part 1 §B.1) --------------------------------------------
 # features, strategies and opportunities may not import the research /
@@ -63,6 +63,7 @@ source_modules =
 forbidden_modules =
     jarvis.timeengine
     jarvis.sessions
+    jarvis.events
     jarvis.ingest
     jarvis.bars
     jarvis.qa
@@ -115,6 +116,7 @@ source_modules =
     jarvis.provenance
     jarvis.timeengine
     jarvis.sessions
+    jarvis.events
     jarvis.ingest
     jarvis.qa
     jarvis.features
@@ -212,6 +214,7 @@ forbidden_modules =
     jarvis.provenance
     jarvis.timeengine
     jarvis.sessions
+    jarvis.events
     jarvis.ingest
     jarvis.qa
     jarvis.features
