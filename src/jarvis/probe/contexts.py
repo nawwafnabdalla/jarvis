@@ -53,20 +53,54 @@ class ProbeParams:
     atr_period_bars: int = 1440
 
 
-def _day_value(features: pl.DataFrame, day_idx: np.ndarray, n_days: int, column: str) -> np.ndarray:
-    """The single (constant-after-close) non-null value of a
-    session_terminal feature column for each trading day, or NaN for a
-    day with none (mirrors jarvis.features.library.pre_london_range_pct_
-    compute's own day-value extraction -- deliberately the same pattern,
-    since both are reading a masked session_terminal series and recovering
-    the day's terminal value from whichever bars are already unmasked)."""
-    tmp = pl.DataFrame({"_day_idx": day_idx, "_v": features[column]})
-    agg = tmp.group_by("_day_idx", maintain_order=True).agg(
-        pl.col("_v").drop_nulls().first().alias("_value")
-    )
+def _day_value(
+    ts: np.ndarray,
+    day_idx: np.ndarray,
+    n_days: int,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    features: pl.DataFrame,
+    column: str,
+) -> np.ndarray:
+    """The value of a session_terminal feature column for each trading
+    day, anchored on that day's own independently-computed window-close
+    instant (`session_window_bounds`'s `starts`/`ends`, indexed by
+    `day_idx` the same way `jarvis.features.library.
+    pre_london_range_pct_compute` and `describe.r1._extract_day_values`/
+    `describe.r2._extract_day_values` already do) -- never inferred from
+    the masked series' own null/non-null transition.
+
+    D-083 (found by an overnight sibling audit, fixed only after the user
+    verified the finding and the fix independently): this function's
+    prior implementation used "first non-null bar of the day" -- the
+    exact anti-pattern D-073 already fixed once in `pre_london_range_pct_
+    compute`, in a second module reading the same D-073-masked series,
+    silently drifted out of sync when D-073 changed the masking semantic
+    project-wide. Under that semantic a day's early bars legitimately
+    carry the PRIOR day's already-completed value, not null, so "first
+    non-null" systematically returned yesterday's value for every day
+    past the first in history. Proven decisive, not just plausible, by
+    `tests/unit/test_probe_contexts.py::
+    test_day_value_decisive_proof_old_logic_returns_yesterdays_value`,
+    which reinstates the old logic in isolation and confirms it produces
+    the exact predicted wrong value before checking this one.
+
+    NaN for a day with no bars in its own window (not eligible), or whose
+    close falls after the last bar in this frame (not yet observable)."""
+    arr = features[column].to_numpy()
+    in_own_window = (ts >= starts[day_idx]) & (ts < ends[day_idx])
+    day_has_own_bars = np.zeros(n_days, dtype=bool)
+    day_has_own_bars[day_idx[in_own_window]] = True
+
+    close_bar_idx = np.searchsorted(ts, ends, side="left")
     out = np.full(n_days, np.nan, dtype=np.float64)
-    if agg.height:
-        out[agg["_day_idx"].to_numpy()] = agg["_value"].to_numpy()
+    for d in range(n_days):
+        if not day_has_own_bars[d]:
+            continue
+        idx = close_bar_idx[d]
+        if idx >= len(ts):
+            continue
+        out[d] = arr[idx]
     return out
 
 
@@ -133,9 +167,9 @@ def detect_events(
     mid = ((bars["bid_c"] + bars["ask_c"]) / 2.0).to_numpy()
     atr = features["atr_bars"].to_numpy().astype(np.float64)
 
-    day_range_pct = _day_value(features, day_idx, n_days, "pre_london_range_pct")
-    day_pre_high = _day_value(features, day_idx, n_days, "pre_london_high")
-    day_pre_low = _day_value(features, day_idx, n_days, "pre_london_low")
+    day_range_pct = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_range_pct")
+    day_pre_high = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_high")
+    day_pre_low = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_low")
 
     events: list[ContextEvent] = []
 
@@ -254,9 +288,12 @@ def context_eligible_days(
         if col not in features.columns:
             raise ValueError(f"context_eligible_days: features frame is missing column {col!r}")
 
-    day_range_pct = _day_value(features, day_idx, n_days, "pre_london_range_pct")
-    day_pre_high = _day_value(features, day_idx, n_days, "pre_london_high")
-    day_pre_low = _day_value(features, day_idx, n_days, "pre_london_low")
+    ts = bars["ts_utc_ns"].to_numpy()
+    pre_starts, pre_ends = session_window_bounds(session_set, "pre_london", days)
+
+    day_range_pct = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_range_pct")
+    day_pre_high = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_high")
+    day_pre_low = _day_value(ts, day_idx, n_days, pre_starts, pre_ends, features, "pre_london_low")
 
     atr = features["atr_bars"].to_numpy().astype(np.float64)
     atr_present = np.zeros(n_days, dtype=bool)

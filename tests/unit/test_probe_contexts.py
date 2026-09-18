@@ -78,12 +78,30 @@ def _find(events, context: str, direction: str = None):
 # C-A ------------------------------------------------------------------
 
 
+def _ca_cd_bars_and_features(range_pct: float):
+    """One anchor bar inside pre_london's own window [00:00,08:00) UTC
+    (2024-01-16, January -- no DST offset), establishing that day's
+    eligibility under the D-083 anchored-extraction fix (a day needs a
+    real bar inside the session's own window to be eligible at all,
+    matching pre_london_range_pct_compute's identical rule); one value
+    bar strictly after close, carrying the actual range_pct the test
+    wants to check (the value is read from the first bar AT OR AFTER
+    close, a different requirement from eligibility -- a single bar
+    can never satisfy both, since one must be < close and the other
+    >= close). Both bars are well clear of london_open_window, so only
+    C-A/C-D are in play."""
+    anchor_ts = _ns(2024, 1, 16, 7, 0)
+    value_ts = _ns(2024, 1, 16, 8, 10)
+    ts_list = [anchor_ts, value_ts]
+    bars = _bars_frame([_bar_row(t, 1.1000) for t in ts_list])
+    features = _features_frame(
+        ts_list, range_pct=[None, range_pct], pre_high=[None, None], pre_low=[None, None], atr=[None, None]
+    )
+    return bars, features
+
+
 def test_context_a_detected_when_range_pct_low():
-    # 2024-01-16 is a Tuesday. A lone bar at 20:00 (well clear of both
-    # pre_london and london_open_window) so only C-A/C-D are in play.
-    ts = _ns(2024, 1, 16, 20, 0)
-    bars = _bars_frame([_bar_row(ts, 1.1000)])
-    features = _features_frame([ts], range_pct=[0.20], pre_high=[None], pre_low=[None], atr=[None])
+    bars, features = _ca_cd_bars_and_features(0.20)
 
     events = detect_events(bars, features, SESSION_SET, ProbeParams())
     ca = _find(events, "C-A")
@@ -95,9 +113,7 @@ def test_context_a_detected_when_range_pct_low():
 
 
 def test_context_a_not_detected_when_range_pct_above_threshold():
-    ts = _ns(2024, 1, 16, 20, 0)
-    bars = _bars_frame([_bar_row(ts, 1.1000)])
-    features = _features_frame([ts], range_pct=[0.50], pre_high=[None], pre_low=[None], atr=[None])
+    bars, features = _ca_cd_bars_and_features(0.50)
 
     events = detect_events(bars, features, SESSION_SET, ProbeParams())
     assert _find(events, "C-A") == []
@@ -108,9 +124,7 @@ def test_context_a_not_detected_when_range_pct_above_threshold():
 
 
 def test_context_d_detected_when_range_pct_high():
-    ts = _ns(2024, 1, 16, 20, 0)
-    bars = _bars_frame([_bar_row(ts, 1.1000)])
-    features = _features_frame([ts], range_pct=[0.80], pre_high=[None], pre_low=[None], atr=[None])
+    bars, features = _ca_cd_bars_and_features(0.80)
 
     events = detect_events(bars, features, SESSION_SET, ProbeParams())
     cd = _find(events, "C-D")
@@ -134,16 +148,26 @@ def test_context_a_and_d_null_when_no_bars_in_window():
 def _london_open_bars_and_features(mids: list[float], *, high: float, low: float, atr: float, start_minute: int = 480):
     """`mids` placed one per minute starting at 08:00 UTC (minute 480 of
     the day), i.e. inside london_open_window (08:00-11:00 London == UTC
-    in January)."""
+    in January). Prepends one anchor bar at 07:00 -- inside pre_london's
+    own window [00:00,08:00) -- carrying the same `high`/`low`/`atr`
+    values: the D-083 anchored-extraction fix requires a real bar inside
+    a session's own window for that day to be ELIGIBLE at all (matching
+    pre_london_range_pct_compute's identical rule), distinct from which
+    bar the VALUE is read from (the first bar at-or-after close, which
+    for `high`/`low` here is this same anchor bar, constant across the
+    whole day anyway). Without it, day_pre_high/day_pre_low would be NaN
+    and every C-B/C-C event below would silently and wrongly not fire."""
     day_start = _ns(2024, 1, 16, 0, 0)
-    ts_list = [Nanos(day_start + (start_minute + i) * NS_PER_MINUTE) for i in range(len(mids))]
-    bars = _bars_frame([_bar_row(t, m) for t, m in zip(ts_list, mids)])
+    anchor_ts = Nanos(day_start + 420 * NS_PER_MINUTE)  # 07:00 UTC
+    event_ts_list = [Nanos(day_start + (start_minute + i) * NS_PER_MINUTE) for i in range(len(mids))]
+    ts_list = [anchor_ts] + event_ts_list
+    bars = _bars_frame([_bar_row(anchor_ts, mids[0])] + [_bar_row(t, m) for t, m in zip(event_ts_list, mids)])
     features = _features_frame(
         ts_list,
-        range_pct=[None] * len(mids),
-        pre_high=[high] * len(mids),
-        pre_low=[low] * len(mids),
-        atr=[atr] * len(mids),
+        range_pct=[None] * len(ts_list),
+        pre_high=[high] * len(ts_list),
+        pre_low=[low] * len(ts_list),
+        atr=[atr] * len(ts_list),
     )
     return bars, features
 
@@ -255,10 +279,12 @@ def test_context_c_reentry_window_is_present_bars_not_calendar():
 
 def test_dedup_context_a_single_event_even_with_multiple_bars_after_close():
     day_start = _ns(2024, 1, 16, 0, 0)
-    ts_list = [Nanos(day_start + m * NS_PER_MINUTE) for m in (490, 500, 510)]
+    anchor_ts = Nanos(day_start + 420 * NS_PER_MINUTE)  # inside pre_london's own window -- establishes eligibility
+    after_close_ts = [Nanos(day_start + m * NS_PER_MINUTE) for m in (490, 500, 510)]
+    ts_list = [anchor_ts] + after_close_ts
     bars = _bars_frame([_bar_row(t, 1.1000) for t in ts_list])
     features = _features_frame(
-        ts_list, range_pct=[0.20, 0.20, 0.20], pre_high=[None] * 3, pre_low=[None] * 3, atr=[None] * 3
+        ts_list, range_pct=[None, 0.20, 0.20, 0.20], pre_high=[None] * 4, pre_low=[None] * 4, atr=[None] * 4
     )
 
     events = detect_events(bars, features, SESSION_SET, ProbeParams())
@@ -277,19 +303,114 @@ def test_detect_events_requires_feature_columns():
 
 
 def test_context_eligible_days():
-    day_start = _ns(2024, 1, 16, 0, 0)
-    ts_eligible = Nanos(day_start + 490 * NS_PER_MINUTE)
-    ts_ineligible = Nanos(_ns(2024, 1, 17, 0, 0) + 490 * NS_PER_MINUTE)
+    # Day 1 gets two bars: one inside its own pre_london window
+    # [00:00,08:00) UTC (establishes eligibility under the D-083
+    # anchored-extraction fix) and one strictly after its own close
+    # (the value is read from the first bar AT OR AFTER close, a
+    # different requirement from eligibility -- a single bar can never
+    # satisfy both). Day 2 gets one bar inside its own window, with
+    # null feature values -- it has real window presence but no
+    # observable close-time value, so it stays correctly ineligible.
+    day1_anchor = _ns(2024, 1, 16, 7, 0)
+    day1_value = _ns(2024, 1, 16, 8, 10)
+    day2_anchor = _ns(2024, 1, 17, 7, 0)
 
-    bars = _bars_frame([_bar_row(ts_eligible, 1.1000), _bar_row(ts_ineligible, 1.1000)])
+    bars = _bars_frame(
+        [_bar_row(day1_anchor, 1.1000), _bar_row(day1_value, 1.1000), _bar_row(day2_anchor, 1.1000)]
+    )
     features = _features_frame(
-        [ts_eligible, ts_ineligible],
-        range_pct=[0.20, None],
-        pre_high=[1.1010, None],
-        pre_low=[1.0990, None],
-        atr=[0.001, None],
+        [day1_anchor, day1_value, day2_anchor],
+        range_pct=[None, 0.20, None],
+        pre_high=[None, 1.1010, None],
+        pre_low=[None, 1.0990, None],
+        atr=[0.001, 0.001, None],
     )
 
     eligible = context_eligible_days(bars, features, SESSION_SET)
     assert date(2024, 1, 16) in eligible
     assert date(2024, 1, 17) not in eligible
+
+
+# D-083 -- decisive proof of the anchored-extraction fix --------------
+#
+# _day_value's pre-fix implementation is reproduced here verbatim, purely
+# to prove the fix is decisive the same way D-073's own decisive test was
+# proven (features/library.py, D-073's writeup): reinstate the OLD logic
+# in isolation and confirm it produces the exact predicted wrong number,
+# rather than merely asserting the NEW logic looks right. Never called by
+# any production code path.
+
+
+def _old_day_value(features: pl.DataFrame, day_idx, n_days: int, column: str):
+    import numpy as np
+
+    tmp = pl.DataFrame({"_day_idx": day_idx, "_v": features[column]})
+    agg = tmp.group_by("_day_idx", maintain_order=True).agg(
+        pl.col("_v").drop_nulls().first().alias("_value")
+    )
+    out = np.full(n_days, np.nan, dtype=np.float64)
+    if agg.height:
+        out[agg["_day_idx"].to_numpy()] = agg["_value"].to_numpy()
+    return out
+
+
+def test_day_value_decisive_proof_old_logic_returns_yesterdays_value():
+    # pre_london closes at exactly 08:00 UTC on both 2024-01-16 and
+    # 2024-01-17 (verified directly: SESSION_SET.window('pre_london', d)
+    # .end_ns for each date, winter, no DST offset). Four bars: one
+    # inside day 1's own window (establishes day 1's eligibility under
+    # the D-083 fix's rule; its own value is irrelevant, deliberately
+    # None), one after day 1's own close (day 1's own true value, H1),
+    # one inside day 2's own window, before day 2's own close (D-073's
+    # "most recently completed instance" carry-forward: still H1, not
+    # null), and one after day 2's own close (day 2's own true value,
+    # H2, deliberately different from H1 so a day-shift bug is
+    # impossible to miss).
+    import numpy as np
+
+    from jarvis.features.base import session_window_bounds, trading_day_boundaries
+
+    day1_anchor = _ns(2024, 1, 16, 7, 0)  # inside day 1's own window
+    day1_close = _ns(2024, 1, 16, 8, 10)  # after day 1's own close
+    day2_early = _ns(2024, 1, 17, 1, 40)  # inside day 2's own window, well before its own close
+    day2_late = _ns(2024, 1, 17, 8, 10)  # after day 2's own close
+
+    ts_list = [day1_anchor, day1_close, day2_early, day2_late]
+    bars = _bars_frame([_bar_row(t, 1.1000) for t in ts_list])
+    H1, H2 = 1.1010, 1.2020
+    features = _features_frame(
+        ts_list,
+        range_pct=[0.5, 0.5, 0.5, 0.5],
+        pre_high=[None, H1, H1, H2],  # D-073 semantic: day 2's early bar carries H1 forward, not null
+        pre_low=[1.0, 1.0, 1.0, 1.0],
+        atr=[0.001, 0.001, 0.001, 0.001],
+    )
+
+    days, day_idx = trading_day_boundaries(bars)
+    assert len(days) == 2
+    n_days = len(days)
+
+    # Prove the bug is real and predictable: the OLD logic, reinstated in
+    # isolation, returns day 1's value for day 2 -- exactly the "first
+    # non-null bar of the day" failure mode D-073's own docstring names.
+    old_result = _old_day_value(features, day_idx, n_days, "pre_london_high")
+    assert old_result[1] == pytest.approx(H1), (
+        f"decisive-test sanity check failed: expected the OLD logic to "
+        f"return day 1's carried-forward value ({H1}) for day 2 -- got "
+        f"{old_result[1]}. If this assertion fails, the fixture itself "
+        f"is not exercising the bug and the test below proves nothing."
+    )
+
+    # Prove the fix: the CURRENT (post-D-083) _day_value, anchored on
+    # each day's own independently-computed window-close instant, returns
+    # day 2's own value for day 2, and day 1's value for day 1 either way.
+    from jarvis.probe.contexts import _day_value
+
+    ts = bars["ts_utc_ns"].to_numpy()
+    starts, ends = session_window_bounds(SESSION_SET, "pre_london", days)
+    new_result = _day_value(ts, day_idx, n_days, starts, ends, features, "pre_london_high")
+    assert new_result[0] == pytest.approx(H1)
+    assert new_result[1] == pytest.approx(H2), (
+        f"D-083 fix did not correct the day-shift bug: expected day 2's "
+        f"own value ({H2}), got {new_result[1]}"
+    )
